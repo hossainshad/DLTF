@@ -1,0 +1,12 @@
+data/
+results/
+__pycache__/
+*.pyc
+*.db
+tpm_state/
+*.ctx
+*.pub
+*.pem
+*.der
+*.name
+quote_nonce.txt
