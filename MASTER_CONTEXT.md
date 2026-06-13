@@ -3,6 +3,77 @@
 Purpose of this document: complete context transfer to a new AI session so development
 can continue without the original conversation. Read fully before touching code.
 
+---
+## SESSION-2 UPDATE (latest — read this first; supersedes conflicting older notes)
+
+This project was set up and verified ON THE USER'S REAL LAPTOP this session.
+PIPELINE GREEN was achieved on hardware. Key new facts and changes:
+
+A. REAL TIER 1 ACHIEVED (major result). Contrary to the earlier assumption that the
+   AMD fTPM has no EK cert, the dev laptop (Ryzen 5 5600X) DOES expose a fetchable EK
+   certificate: issuer "Advanced Micro Devices, CN = PRG-RN", chaining PRG-RN ->
+   self-signed AMDTPM root. It chain-verifies in DLTF's own verify_ek_certificate
+   (returns True) and via `openssl verify` (ek.pem: OK). So the thesis can now
+   demonstrate a REAL Tier 1 node, not only the test-CA simulation. CA bundle saved at
+   tpm/ca/amd_ftpm_ca.pem (= PRG-RN intermediate + AMDTPM root, PEM). EK cert saved as
+   ek.crt (DER, 1262 bytes). Reframe the thesis claim accordingly:
+   "Tier 1 demonstrated on commodity AMD hardware with manufacturer-verified attestation."
+   NOTE: not all AMD fTPMs have this; it is board/BIOS dependent. Tier model still
+   degrades correctly to Tier 2 when the cert is absent.
+
+B. INTEROP FINDING (good viva material). AMD EK certs are technically malformed: a
+   non-spec DEFAULT encoding on an extension `critical` field. Python `cryptography`
+   (strict, Rust parser) REJECTS them with ParseError(EncodedDefault); openssl is
+   lenient and accepts them. Fix applied: tpm/common.py verify_ek_certificate now
+   falls back to `_verify_with_openssl` (shells `openssl verify -partial_chain`) when
+   the strict parser throws. Synthetic test-CA path still uses the strict parser.
+
+C. FILE FIXES applied this session (the corrected versions are the source of truth):
+   - tpm/client.py: _Tpm2Signer._try_ek_cert now calls
+     `tpm2_getekcertificate -u <ek.pub> -o <out> -X` (was missing -u, always failed).
+   - tpm/check_ek_cert.py: fetch_ek_cert now runs tpm2_createek THEN getekcertificate
+     with -u and -X; added a `--ek-cert <file>` flag to verify a saved cert without the
+     flaky live network fetch (AMD's PKI server is unreliable). Verification (chain
+     check) is NOT skipped by this flag; only the fetch is.
+   - tpm/common.py: openssl fallback (see B). PSS-aware _sig_ok also added.
+   - trust/filter.py: classify() now returns {} on empty input (crash fix: the eval
+     sweep, with no attackers and aggressive thresholds, banned ALL honest clients,
+     leaving updates empty -> np.stack([]) crashed). One-line guard added.
+   - fl/server.py: reputation_engine is now an injectable constructor arg
+     (default ReputationEngine), enabling the beta-engine ablation.
+
+D. NEW FILES this session:
+   - trust/reputation_beta.py: Bayesian beta engine, same interface, ablation arm
+     (hardware-informed priors Beta(8,2)/(4,2)/(2,2); tier-coupled forgetting; strike
+     policy EMERGES from the math). Added to tests/test_pipeline.py.
+   - run_server.py (project root): server-PC runner (build handles from config, enroll,
+     run rounds, write audit to results/audit.jsonl).
+   - tpm/FETCH_EK_CERT.md: step-by-step to fetch+verify an EK cert on any AMD client.
+   - tpm/ca/amd_ftpm_ca.pem, ek.crt: real-hardware artifacts (on the user's machine).
+
+E. FULL EVAL RAN on the user's machine (5 seeds, 30 rounds), all --check assertions
+   passed. Representative numbers: attacker cost per identity Tier1 ~0.86 vs Tier2 ~0.017
+   vs Tier3 ~0.003 (identities burned: ~7.8 Tier1 vs 30 Tier2/3 over 30 rounds);
+   rehab recovering 5/5 REINSTATED, persistent 0/5; sweep honest FPR 0.000 through
+   COSINE_MEDIAN_THRESHOLD -0.35, rising to 0.057 at -0.25 and 0.400 at -0.15 (so the
+   -0.45 default sits safely on the zero-FPR shelf). FoolsGold/NormClip FPR 0.000 across
+   their grids. NOTE: the value-arithmetic numbers above are from the ADDITIVE engine.
+
+F. COMMON SETUP GOTCHA: the two files both named client.py (tpm/client.py vs
+   fl/client.py) collide on download. The user hit ImportError because an OLD
+   tpm_client.py (top-level `from common import EK_RSA_CERT_NV`, class TPMClient, no
+   make_signer) had been placed at tpm/client.py. Correct tpm/client.py begins with
+   `from tpm.common import (b64d, b64e, sha256_hex, run, mock_key, mock_ek_hash)` and
+   ends with a make_signer() factory. Always verify that first import line after copying.
+
+G. CA ALLOW-LIST caveat (limitation to state): Tier 1 is only as sound as the trusted
+   CA bundle. A real cloud/VM TPM with a genuine vendor-signed EK cert WOULD verify if
+   that vendor CA is trusted; defense is to allow-list only intended manufacturer roots
+   (AMD/Intel/Infineon). Mass Tier-1 identities then require renting real attested VMs
+   = bounded by rental cost, consistent with the hardware-cost-bound claim.
+---
+
+
 User context: Sazzad, CS undergraduate thesis at BRAC University, defending Summer 2026.
 Dev machine: Ryzen 5 5600X with AMD fTPM (which has NO fetchable EK certificate — this
 fact shaped the architecture). Communication style: terse, direct, wants short answers,
@@ -53,7 +124,7 @@ Plus **eval/** (Chapter 4 experiment harness) and **tests/** (pipeline capstone)
 | Tier | Proof | Weight cap | Strikes | Rehab |
 |---|---|---|---|---|
 | 1 HARDWARE | EK cert chains to manufacturer CA AND credential activation passes | 1.0 | 2 MAJOR | Yes |
-| 2 TPM_RESIDENT | Activation only (swtpm passes this; AMD fTPM lands here) | 0.5 | 1 | No |
+| 2 TPM_RESIDENT | Activation only (swtpm passes this). NOTE: the user's AMD fTPM DOES have a cert and reaches Tier 1; see Session-2 Update A | 0.5 | 1 | No |
 | 3 SOFTWARE | Nothing proven (TOFU) | 0.1 | 1 | No |
 
 Core idea: identity replacement cost determines policy. Expensive identities (Tier 1)
@@ -70,6 +141,8 @@ dltf/
 ├── requirements.txt
 ├── setup.sh                   # scaffold generator
 ├── tpm/
+│   ├── FETCH_EK_CERT.md       # step-by-step EK cert fetch+verify for new AMD clients
+│   ├── ca/amd_ftpm_ca.pem     # real AMD CA bundle (PRG-RN + AMDTPM root) [on user machine]
 │   ├── common.py              # Tier enum (canonical), assess_tier, EK cert verify,
 │   │                          #   make_credential, test CA generator
 │   ├── client.py              # TPMSigner backends: mock / swtpm / real + factory
@@ -319,9 +392,11 @@ headline claims. Verified results (3 seeds, 25 rounds, synthetic):
 - Rehab: recovering 3/3 REINSTATED; persistent 0/3.
 - Sweep: honest FPR 0.000 at default −0.45, cliffs to 0.095/0.334 at −0.35/−0.25.
 
-PENDING machine-side (user must run): fl/model.py self-test (torch), full MNIST runs,
-tpm/check_ek_cert.py on the Ryzen (expect Tier 2 — AMD fTPM has no EK cert), swtpm/real
-backend paths, final eval at --seeds 5 --rounds 30, beta-engine ablation run.
+DONE on the user's machine: full pipeline (PIPELINE GREEN), full eval 5seeds/30rounds
+(all --check passed), real Tier-1 EK cert verification on the AMD fTPM.
+STILL PENDING machine-side: fl/model.py self-test (needs torch), full MNIST accuracy
+runs (synthetic substrate used so far), swtpm/real signer enrollment end-to-end,
+beta-engine ablation eval run, live multi-PC / Tailscale demo.
 
 ## 21. Known limitations (state ALL in thesis)
 
