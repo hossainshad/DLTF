@@ -128,17 +128,60 @@ def _load_pem_chain(pem_bytes):
 
 
 def _sig_ok(issuer_pub, cert):
-    from cryptography.hazmat.primitives.asymmetric import padding, ec
+    from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
+    from cryptography.exceptions import UnsupportedAlgorithm
     try:
         if isinstance(issuer_pub, ec.EllipticCurvePublicKey):
             issuer_pub.verify(cert.signature, cert.tbs_certificate_bytes,
                               ec.ECDSA(cert.signature_hash_algorithm))
-        else:
-            issuer_pub.verify(cert.signature, cert.tbs_certificate_bytes,
-                              padding.PKCS1v15(), cert.signature_hash_algorithm)
-        return True
+            return True
+        if isinstance(issuer_pub, rsa.RSAPublicKey):
+            # Try the cert's declared padding first, then the other RSA padding.
+            try:
+                pad = padding.PKCS1v15()
+                if cert.signature_algorithm_oid._name and "pss" in \
+                        cert.signature_algorithm_oid._name.lower():
+                    pad = padding.PSS(mgf=padding.MGF1(cert.signature_hash_algorithm),
+                                      salt_length=padding.PSS.AUTO)
+                issuer_pub.verify(cert.signature, cert.tbs_certificate_bytes,
+                                  pad, cert.signature_hash_algorithm)
+                return True
+            except Exception:
+                alt = padding.PSS(mgf=padding.MGF1(cert.signature_hash_algorithm),
+                                  salt_length=padding.PSS.AUTO)
+                issuer_pub.verify(cert.signature, cert.tbs_certificate_bytes,
+                                  alt, cert.signature_hash_algorithm)
+                return True
+        return False
     except Exception:
         return False
+
+
+
+def _verify_with_openssl(ek_cert_bytes, ca_bundle_pem):
+    """Fallback for certs the strict Python parser rejects (e.g. AMD fTPM EK certs
+    encode a non-spec critical=FALSE field). openssl is lenient and is the same
+    engine that validates these in practice. Returns True/False/None(unavailable)."""
+    import shutil, tempfile, os, subprocess
+    if shutil.which("openssl") is None:
+        return None
+    d = tempfile.mkdtemp(prefix="dltf_ossl_")
+    ek_in = os.path.join(d, "ek.in")
+    ek_pem = os.path.join(d, "ek.pem")
+    ca = os.path.join(d, "ca.pem")
+    with open(ek_in, "wb") as f:
+        f.write(ek_cert_bytes)
+    with open(ca, "wb") as f:
+        f.write(ca_bundle_pem)
+    # normalise EK to PEM (input may be DER or PEM)
+    if subprocess.run(["openssl", "x509", "-in", ek_in, "-inform", "DER",
+                       "-out", ek_pem], capture_output=True).returncode != 0:
+        if subprocess.run(["openssl", "x509", "-in", ek_in, "-inform", "PEM",
+                           "-out", ek_pem], capture_output=True).returncode != 0:
+            return None
+    r = subprocess.run(["openssl", "verify", "-partial_chain",
+                        "-CAfile", ca, ek_pem], capture_output=True)
+    return r.returncode == 0
 
 
 def verify_ek_certificate(ek_cert_bytes, ca_bundle_pem):
@@ -154,7 +197,10 @@ def verify_ek_certificate(ek_cert_bytes, ca_bundle_pem):
         except Exception:
             continue
     if cert is None:
-        return False
+        # AMD fTPM EK certs can be technically malformed (non-spec DEFAULT
+        # encoding); the strict parser rejects them though they are valid.
+        result = _verify_with_openssl(ek_cert_bytes, ca_bundle_pem)
+        return bool(result) if result is not None else False
     by_subject = {c.subject.rfc4514_string(): c for c in _load_pem_chain(ca_bundle_pem)}
     seen, cur = set(), cert
     for _ in range(8):

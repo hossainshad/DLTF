@@ -24,11 +24,21 @@ EK_CERT_NV_INDICES = ["0x01C00002", "0x01C0000A"]
 
 def fetch_ek_cert(tcti=None):
     suffix = (["-T", tcti] if tcti else [])
-    out = os.path.join(tempfile.mkdtemp(prefix="dltf_ekcrt_"), "ek.crt")
+    work = tempfile.mkdtemp(prefix="dltf_ekcrt_")
+    ek_ctx = os.path.join(work, "ek.ctx")
+    ek_pub = os.path.join(work, "ek.pub")
+    out = os.path.join(work, "ek.crt")
+    # tpm2_getekcertificate needs the EK public key, so create it first.
     try:
-        run(["tpm2_getekcertificate", "-o", out] + suffix)
+        run(["tpm2_createek", "-c", ek_ctx, "-G", "rsa", "-u", ek_pub] + suffix)
+    except Exception:
+        return None, None
+    try:
+        run(["tpm2_getekcertificate", "-u", ek_pub, "-o", out, "-X"] + suffix)
         with open(out, "rb") as f:
-            return f.read(), "tpm2_getekcertificate"
+            data = f.read()
+        if data:
+            return data, "tpm2_getekcertificate"
     except Exception:
         pass
     for nv in EK_CERT_NV_INDICES:
@@ -44,10 +54,17 @@ def fetch_ek_cert(tcti=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="DLTF EK certificate / trust-tier diagnostic")
     ap.add_argument("--tcti", default=None, help="e.g. device:/dev/tpmrm0 or swtpm:...")
+    ap.add_argument("--ek-cert", default=None,
+                    help="use a saved EK cert file (DER/PEM) instead of live fetch")
     ap.add_argument("--ca-bundle", default=None, help="manufacturer CA bundle (PEM) to verify against")
     args = ap.parse_args(argv)
 
-    cert, source = fetch_ek_cert(args.tcti)
+    if args.ek_cert:
+        with open(args.ek_cert, "rb") as f:
+            cert = f.read()
+        source = f"file {args.ek_cert}"
+    else:
+        cert, source = fetch_ek_cert(args.tcti)
     if cert is None:
         print("EK certificate: NOT FOUND")
         print("Predicted tier: Tier 2 TPM_RESIDENT (credential activation only)")
