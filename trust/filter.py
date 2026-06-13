@@ -77,6 +77,8 @@ class GradientFilter:
         from the previous round. Returns dict[device_id, Classification]."""
         prev_weights = prev_weights or {}
         ids = list(gradients.keys())
+        if not ids:
+            return {}
         arr = {i: np.asarray(gradients[i], dtype=np.float64) for i in ids}
 
         # Robust reference over prior-trusted contributors, leave-one-out:
