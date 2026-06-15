@@ -113,3 +113,46 @@ If your friend's laptop is also a same-generation AMD (Ryzen 5000-series), its E
 Different CPU vendor (Intel, or a discrete TPM): steps 5-7 URLs will point somewhere else entirely — that's fine, the cert's own "CA Issuers" field always tells you where. The procedure is identical; only the URLs differ.
 
 Paste the step-9 output from the friend's machine and I'll confirm what tier it landed on.
+
+
+
+
+Same procedure, different fetch step — Intel doesn't put the cert URL inside the cert. Two cases:
+
+Case A — Intel fTPM on a laptop (most common, like your friend's if it's Intel):
+Intel fTPM EK certs are usually stored on Intel's server, and tpm2_getekcertificate knows how to fetch them automatically (it detects Intel and queries Intel's EK Recovery service). So steps 1-4 are identical:
+
+tpm2_createek -c ek.ctx -G rsa -u ek.pub
+tpm2_getekcertificate -u ek.pub -o ek.crt -X 2>/dev/null
+[ -s ek.crt ] && echo "HAS EK CERT" || echo "NO EK CERT"
+
+The difference: Intel certs are often ECC, not RSA. If the RSA attempt above gives nothing, try ECC:
+
+tpm2_createek -c ek.ctx -G ecc -u ek.pub
+tpm2_getekcertificate -u ek.pub -o ek.crt -X 2>/dev/null
+[ -s ek.crt ] && echo "HAS EK CERT (ecc)" || echo "NO EK CERT"
+
+Case B — discrete TPM chip (Infineon/STMicro/Nuvoton, common on desktops):
+The cert is stored inside the TPM's NV memory, not online. Read it directly:
+
+tpm2_getekcertificate -u ek.pub -o ek.crt 2>/dev/null    # no -X; reads local NV
+# if empty, try the standard NV indices:
+tpm2_nvread 0x01C00002 -o ek.crt 2>/dev/null              # RSA EK cert index
+tpm2_nvread 0x01C0000A -o ek.crt 2>/dev/null              # ECC EK cert index
+[ -s ek.crt ] && echo "HAS EK CERT" || echo "NO EK CERT"
+
+Then for both cases — find the CA chain:
+Unlike AMD, you may need to inspect the issuer and get Intel's/the vendor's CA manually:
+
+openssl x509 -in ek.crt -inform DER -text -noout | grep -A1 "CA Issuers\|Issuer:"
+
+    If it shows a CA Issuers - URI: → same as AMD steps 5-8, curl those URLs.
+    If it shows no AIA URL (common for Intel) → you download Intel's EK certificate chain manually from Intel's website (search "Intel TPM EK Certificate chain" / "Intel onboard credentials CA"), save those as the bundle, and verify with the same openssl verify command.
+
+Honest heads-up: Intel's CA distribution is messier than AMD's clean AIA URLs — the chain often isn't linkable automatically, so you fetch Intel's root/intermediate from their site once and reuse it for all Intel clients. Your verify_ek_certificate + openssl fallback handles ECC and the malformed-cert cases already, so the code side needs no changes — only the bundle differs per vendor.
+
+Practical advice: run step 4/A on the Intel laptop first and paste me:
+
+openssl x509 -in ek.crt -inform DER -text -noout | grep "Issuer:\|Public Key Algorithm\|CA Issuers"
+
+That one output tells me exactly which sub-case you're in, and I'll give you the precise CA-fetch commands for that machine instead of guessing.

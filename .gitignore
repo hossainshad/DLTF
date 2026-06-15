@@ -1,12 +1,70 @@
-data/
-results/
-__pycache__/
-*.pyc
-*.db
-tpm_state/
-*.ctx
-*.pub
+# ============================================================
+# DLTF .gitignore
+# ============================================================
+
+# ---- SECRETS / PRIVATE TPM + CRYPTO MATERIAL (never commit) ----
+# EK certificates and keys fetched from the TPM / manufacturer
+ek.crt
+ek.pub
+ek.pem
+ek.ctx
+ak.ctx
+ak.pub
+ak.name
+rsa.pem
+*.ek
+# AMD/Intel CA chain artifacts pulled per-machine
+amd_ca.crt
+amd_root.crt
+prg_rn.pem
+amdtpm.pem
+# the assembled CA bundle is environment-specific; keep it local
+tpm/ca/
+# audit chain HMAC signing key (secret) and any key sidecars
+*.key
+results/audit.jsonl.key
+# generic cert/key catch-alls
 *.pem
 *.der
-*.name
-quote_nonce.txt
+*.crt
+*.csr
+*.p12
+*.pfx
+# swtpm state
+*.swtpm
+/tmp/dltf-swtpm-*/
+
+# ---- GENERATED OUTPUTS (reproducible, no need to commit) ----
+results/
+data/
+*.csv
+*.png
+*.jsonl
+
+# ---- PYTHON ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---- EDITOR / OS ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- KEEP THESE (whitelist notes) ----
+# config.py IS committed (topology), but if it ever holds secrets, ignore it.
+# tpm/FETCH_EK_CERT.md, README.md, MASTER_CONTEXT.md are committed docs.

@@ -4,6 +4,92 @@ Purpose of this document: complete context transfer to a new AI session so devel
 can continue without the original conversation. Read fully before touching code.
 
 ---
+## SESSION-3 UPDATE (NEWEST — read before Session-2; covers live deployment)
+
+This session took the system from "passes tests on one machine" to "running across
+real machines over the internet." Plus more real fixes. Key facts:
+
+LIVE DISTRIBUTED RUN ACHIEVED. 3 physical laptops on a Tailscale VPN tailnet
+(account tpm97510@): one ubuntu box as SERVER, two HP laptops as CLIENTS. Enrollment,
+tier assignment (both Tier 2 / TPM_RESIDENT under mock backend, weight 0.5), and the
+round loop all ran successfully over real HTTP between machines. Audit chain written
+to results/audit.jsonl on the server.
+
+DEPLOYMENT METHOD = TAILSCALE (not plain LAN). Home routers / Bangladeshi CGNAT block
+direct inbound, so machines are joined to one Tailscale account; each gets a stable
+100.x.y.z IP; those IPs go in config.py endpoints. The SERVER's own IP is NOT in
+config (server connects out to clients; clients never dial the server). All machines
+must be on the SAME Tailscale account or they cannot see each other (a real gotcha hit
+this session: machines were accidentally on different accounts -> only 1 showed in
+`tailscale status` -> fix: `sudo tailscale logout` then `sudo tailscale up` into one
+account on every machine). Tailscale also WireGuard-encrypts traffic, mitigating the
+plain-HTTP limitation in deployment.
+
+NEW / CHANGED FILES this session (these are the source of truth now):
+  - run_server.py (REWRITTEN): now has a --stub flag. WITHOUT --stub it builds the
+    REAL MNISTModel and sends its 409,034 params as the initial global model; WITH
+    --stub it sends a tiny --dim vector for a no-torch networking test. Also does
+    os.makedirs("results", exist_ok=True). The OLD run_server.py always sent a 6-value
+    stub vector, which made real clients crash (see bug B below). The server therefore
+    needs torch installed when running real mode.
+  - net/agent.py (TWO FIXES): (1) do_POST now reads the request body in a LOOP until
+    all Content-Length bytes arrive (a single rfile.read(n) truncates multi-MB
+    payloads; the 409k-float model is ~8 MB, so stub worked but real training 500'd).
+    (2) the 500 handler now prints a full traceback server-side so client errors are
+    visible instead of an opaque HTTP 500.
+  - fl/dataset.py (FIX): non_iid_partition now guards the leak step with
+    `if num_clients > 1:` (with a single client, rng.choice(others) got an empty list
+    and crashed). Multi-client behavior unchanged.
+  - config.py: real deployment form is an explicit CLIENTS list with Tailscale IPs and
+    NUM_CLIENTS = number of CLIENT machines (server excluded). mock backend -> Tier 2.
+
+BUGS FOUND AND FIXED THIS SESSION (good viva / engineering-section material):
+  A. Stale file: an OLD tpm_client.py had been placed at tpm/client.py (top-level
+     `from common import EK_RSA_CERT_NV`, class TPMClient, no make_signer). Correct
+     tpm/client.py starts `from tpm.common import (b64d, b64e, sha256_hex, run,
+     mock_key, mock_ek_hash)` and ends with a make_signer() factory. ALWAYS verify the
+     first import line after copying files; and note the two-client.py collision
+     (tpm/client.py vs fl/client.py both download as client.py).
+  B. Model-size mismatch: real clients got "shape '[16,1,3,3]' is invalid for input of
+     size 6" because the server was still sending the 6-value stub. Root cause: server
+     running the OLD run_server.py. Fix: use the rewritten run_server.py (prints
+     "real MNIST model: 409034 parameters" as its first line in real mode).
+  C. HTTP body truncation on large payloads (net/agent.py chunked-read fix above).
+  D. filter.py empty-input crash on the all-honest eval sweep (already fixed Session 2,
+     still in force): classify() returns {} when gradients is empty.
+
+REAL-HARDWARE EK CERT (carried from Session 2, still true): the s4zz4d AMD fTPM HAS a
+fetchable EK cert (issuer AMD PRG-RN) that chain-verifies PRG-RN -> AMDTPM root;
+verify_ek_certificate returns True (via openssl fallback for AMD's non-spec cert).
+tpm/FETCH_EK_CERT.md documents the fetch procedure. To use real Tier 1 in deployment,
+set a client's tpm_backend="real" and load tpm/ca/amd_ftpm_ca.pem as the server's
+ca_bundle_pem; the mock runs above used Tier 2.
+
+RUN ORDER (real, over Tailscale), the working recipe:
+  0. All machines on ONE Tailscale account; `tailscale status` shows them all.
+  1. torch + torchvision installed on SERVER and all CLIENTS (server imports MNISTModel).
+  2. Same config.py on every machine (CLIENTS = the client IPs; NUM_CLIENTS = their count).
+  3. Each CLIENT: `PYTHONPATH=. python3 -m net.agent --label clientN --port 8470`
+     (omit --stub for real MNIST training; first start downloads MNIST). LEAVE RUNNING.
+  4. SERVER: `curl http://<clientIP>:8470/health` for each (expect {"ok":true}), then
+     `PYTHONPATH=. python3 run_server.py --rounds 5` (must print the 409034 line).
+  Networking gotchas seen: agents must stay running (own terminal, shows "listening");
+  ConnectionRefused = agent not running / wrong port; opaque 500 = client-side crash,
+  read the CLIENT agent terminal (now prints full traceback).
+
+STILL PENDING when this session ended: the user was mid-fix on bug B (replacing the
+OLD run_server.py on the SERVER with the rewritten one + installing torch on the
+server). Once the server prints "real MNIST model: 409034 parameters", real 2-client
+MNIST training over Tailscale should complete. After that: the live attack demo (one
+client sends poisoned updates to show a real flag+ban), real-TPM Tier-1 enrollment,
+and the beta-engine ablation eval run.
+
+A .gitignore was added that excludes EK/AK certs and keys (ek.crt, *.pem, *.key,
+tpm/ca/, results/audit.jsonl.key), generated outputs (results/, data/, *.csv, *.png),
+and Python/editor cruft. config.py is committed; force-add a sample CA bundle if you
+want it as a thesis artifact.
+
+---
 ## SESSION-2 UPDATE (latest — read this first; supersedes conflicting older notes)
 
 This project was set up and verified ON THE USER'S REAL LAPTOP this session.

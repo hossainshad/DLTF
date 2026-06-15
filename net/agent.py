@@ -78,12 +78,21 @@ def _make_handler(agent):
 
         def do_POST(self):
             n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n).decode() or "{}")
+            chunks, remaining = [], n
+            while remaining > 0:
+                part = self.rfile.read(min(remaining, 1 << 20))
+                if not part:
+                    break
+                chunks.append(part)
+                remaining -= len(part)
+            body = json.loads(b"".join(chunks).decode() or "{}")
             try:
                 self._send(200, agent.dispatch(self.path, body))
             except KeyError:
                 self._send(404, {"error": "not found"})
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self._send(500, {"error": str(e)})
     return Handler
 
