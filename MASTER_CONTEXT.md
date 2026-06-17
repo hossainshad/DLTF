@@ -4,6 +4,46 @@ Purpose of this document: complete context transfer to a new AI session so devel
 can continue without the original conversation. Read fully before touching code.
 
 ---
+## SESSION-4 UPDATE (NEWEST — read before all earlier updates)
+
+SINGLE REPUTATION ENGINE NOW. The two-engine setup (additive + beta ablation) was
+collapsed into ONE hardened engine living in trust/reputation.py. trust/reputation_beta.py
+was DELETED. Do not reference an "ablation" or "two engines" anymore.
+
+The surviving engine (in trust/reputation.py, class name ReputationEngine) is the
+hardened Bayesian beta engine:
+  - Trust = Beta posterior T = (a0+s)/(a0+s+b0+f), Josang & Ismail 2002.
+  - Hardware-informed priors by tier: Beta(8,2)/(4,2)/(2,2) -> start trust 0.80/0.67/0.50.
+  - Strike policy EMERGES from the math (Tier-1 hits probation T<=0.5 at exactly the
+    2nd MAJOR; Tier-2 at the 1st; Tier-3 at any offense).
+  - M1 bounded recency: good evidence s decays at GAMMA_GOOD (0.90/0.80/0.67),
+    saturating at 10/5/3 effective rounds, so a sleeper cannot bank unbounded cushion.
+  - M2 earned forgetting: bad evidence f is sticky, fades only after FORGIVE_AFTER=5
+    consecutive clean rounds and only for Tier 1 (FORGET 0.95; 1.0=never for T2/T3).
+  - M3 sustained escalation: 2 consecutive MAJORs escalate non-compensably (bypasses
+    the score), catching a high-trust veteran sleeper in 2 rounds.
+  - CRITICAL non-compensable; bans bind to EK hash (O2); probation cap 0.1; closed-form
+    reinstatement to T>=0.55.
+  Constants are theory-grounded (Sun et al. on-off defense; CONFIDANT recency;
+  Slovic 1993 trust asymmetry; Josang & Ismail 2002), answering the supervisor's
+  "why these numbers" challenge with derivations, not arbitrary picks.
+
+CONSEQUENCES for anyone continuing:
+  - trust/reputation.py still exports Status, EventTier, PROBATION_WEIGHT_CAP, so all
+    `from trust.reputation import ...` imports are unchanged.
+  - Behaviour differs from the OLD additive engine: honest Tier-2 weight is ~0.38
+    (cap 0.5 x posterior), NOT 0.5; Tier-1 starts at 0.8 not 1.0. Hardcoded-0.5 weight
+    assertions in fl/server.py, net/handles.py, tests/test_pipeline.py were relaxed to
+    ranges (0.3..0.5). PIPELINE GREEN confirmed.
+  - run_local.py lost its --engine flag (one engine now): flags are --clients,
+    --attackers, --rounds.
+  - RE-RUN the eval suite to regenerate Chapter 4 numbers under the new arithmetic;
+    prior CSV numbers were from the additive engine.
+  - Earlier sections of THIS document that mention "additive vs beta", "ablation arm",
+    or fixed deltas (-10/-25/-60, R_INIT=100) describe the SUPERSEDED engine. The beta
+    arithmetic above is authoritative.
+
+---
 ## SESSION-3 UPDATE (NEWEST — read before Session-2; covers live deployment)
 
 This session took the system from "passes tests on one machine" to "running across
