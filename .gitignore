@@ -4,6 +4,7 @@
 
 # ---- SECRETS / PRIVATE TPM + CRYPTO MATERIAL (never commit) ----
 # EK certificates and keys fetched from the TPM / manufacturer
+cert
 ek.crt
 ek.pub
 ek.pem
