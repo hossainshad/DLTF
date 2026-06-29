@@ -124,8 +124,11 @@ class _Tpm2Signer(TPMSigner):
                                ek_pub_path=self._ek_pub, ak_pub_path=self._ak_pub)
 
     def _try_ek_cert(self):
-        # Many AMD fTPMs have no fetchable EK cert; degrade to Tier 2 in that case.
-        # getekcertificate needs the EK public key produced by createek above.
+        # Prefer a verified on-disk cert (AMD PKI live-fetch is flaky); fetch as fallback.
+        for p in ("cert/ek.crt", "ek.crt"):
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return f.read()
         out = os.path.join(self.workdir, "ek.crt")
         try:
             run(self._t(["tpm2_getekcertificate", "-u", self._ek_pub, "-o", out, "-X"]))
