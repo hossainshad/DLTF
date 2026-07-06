@@ -1,615 +1,311 @@
-# MASTER_CONTEXT.md — DLTF Thesis Project Handoff
+# MASTER_CONTEXT.md — DLTF Thesis, Current State
 
-Purpose of this document: complete context transfer to a new AI session so development
-can continue without the original conversation. Read fully before touching code.
+Complete context for continuing the DLTF thesis in a new session. This describes
+the system AS IT STANDS NOW. Read fully before touching code.
 
----
-## SESSION-4 UPDATE (NEWEST — read before all earlier updates)
-
-SINGLE REPUTATION ENGINE NOW. The two-engine setup (additive + beta ablation) was
-collapsed into ONE hardened engine living in trust/reputation.py. trust/reputation_beta.py
-was DELETED. Do not reference an "ablation" or "two engines" anymore.
-
-The surviving engine (in trust/reputation.py, class name ReputationEngine) is the
-hardened Bayesian beta engine:
-  - Trust = Beta posterior T = (a0+s)/(a0+s+b0+f), Josang & Ismail 2002.
-  - Hardware-informed priors by tier: Beta(8,2)/(4,2)/(2,2) -> start trust 0.80/0.67/0.50.
-  - Strike policy EMERGES from the math (Tier-1 hits probation T<=0.5 at exactly the
-    2nd MAJOR; Tier-2 at the 1st; Tier-3 at any offense).
-  - M1 bounded recency: good evidence s decays at GAMMA_GOOD (0.90/0.80/0.67),
-    saturating at 10/5/3 effective rounds, so a sleeper cannot bank unbounded cushion.
-  - M2 earned forgetting: bad evidence f is sticky, fades only after FORGIVE_AFTER=5
-    consecutive clean rounds and only for Tier 1 (FORGET 0.95; 1.0=never for T2/T3).
-  - M3 sustained escalation: 2 consecutive MAJORs escalate non-compensably (bypasses
-    the score), catching a high-trust veteran sleeper in 2 rounds.
-  - CRITICAL non-compensable; bans bind to EK hash (O2); probation cap 0.1; closed-form
-    reinstatement to T>=0.55.
-  Constants are theory-grounded (Sun et al. on-off defense; CONFIDANT recency;
-  Slovic 1993 trust asymmetry; Josang & Ismail 2002), answering the supervisor's
-  "why these numbers" challenge with derivations, not arbitrary picks.
-
-CONSEQUENCES for anyone continuing:
-  - trust/reputation.py still exports Status, EventTier, PROBATION_WEIGHT_CAP, so all
-    `from trust.reputation import ...` imports are unchanged.
-  - Behaviour differs from the OLD additive engine: honest Tier-2 weight is ~0.38
-    (cap 0.5 x posterior), NOT 0.5; Tier-1 starts at 0.8 not 1.0. Hardcoded-0.5 weight
-    assertions in fl/server.py, net/handles.py, tests/test_pipeline.py were relaxed to
-    ranges (0.3..0.5). PIPELINE GREEN confirmed.
-  - run_local.py lost its --engine flag (one engine now): flags are --clients,
-    --attackers, --rounds.
-  - RE-RUN the eval suite to regenerate Chapter 4 numbers under the new arithmetic;
-    prior CSV numbers were from the additive engine.
-  - Earlier sections of THIS document that mention "additive vs beta", "ablation arm",
-    or fixed deltas (-10/-25/-60, R_INIT=100) describe the SUPERSEDED engine. The beta
-    arithmetic above is authoritative.
-
----
-## SESSION-3 UPDATE (NEWEST — read before Session-2; covers live deployment)
-
-This session took the system from "passes tests on one machine" to "running across
-real machines over the internet." Plus more real fixes. Key facts:
-
-LIVE DISTRIBUTED RUN ACHIEVED. 3 physical laptops on a Tailscale VPN tailnet
-(account tpm97510@): one ubuntu box as SERVER, two HP laptops as CLIENTS. Enrollment,
-tier assignment (both Tier 2 / TPM_RESIDENT under mock backend, weight 0.5), and the
-round loop all ran successfully over real HTTP between machines. Audit chain written
-to results/audit.jsonl on the server.
-
-DEPLOYMENT METHOD = TAILSCALE (not plain LAN). Home routers / Bangladeshi CGNAT block
-direct inbound, so machines are joined to one Tailscale account; each gets a stable
-100.x.y.z IP; those IPs go in config.py endpoints. The SERVER's own IP is NOT in
-config (server connects out to clients; clients never dial the server). All machines
-must be on the SAME Tailscale account or they cannot see each other (a real gotcha hit
-this session: machines were accidentally on different accounts -> only 1 showed in
-`tailscale status` -> fix: `sudo tailscale logout` then `sudo tailscale up` into one
-account on every machine). Tailscale also WireGuard-encrypts traffic, mitigating the
-plain-HTTP limitation in deployment.
-
-NEW / CHANGED FILES this session (these are the source of truth now):
-  - run_server.py (REWRITTEN): now has a --stub flag. WITHOUT --stub it builds the
-    REAL MNISTModel and sends its 409,034 params as the initial global model; WITH
-    --stub it sends a tiny --dim vector for a no-torch networking test. Also does
-    os.makedirs("results", exist_ok=True). The OLD run_server.py always sent a 6-value
-    stub vector, which made real clients crash (see bug B below). The server therefore
-    needs torch installed when running real mode.
-  - net/agent.py (TWO FIXES): (1) do_POST now reads the request body in a LOOP until
-    all Content-Length bytes arrive (a single rfile.read(n) truncates multi-MB
-    payloads; the 409k-float model is ~8 MB, so stub worked but real training 500'd).
-    (2) the 500 handler now prints a full traceback server-side so client errors are
-    visible instead of an opaque HTTP 500.
-  - fl/dataset.py (FIX): non_iid_partition now guards the leak step with
-    `if num_clients > 1:` (with a single client, rng.choice(others) got an empty list
-    and crashed). Multi-client behavior unchanged.
-  - config.py: real deployment form is an explicit CLIENTS list with Tailscale IPs and
-    NUM_CLIENTS = number of CLIENT machines (server excluded). mock backend -> Tier 2.
-
-BUGS FOUND AND FIXED THIS SESSION (good viva / engineering-section material):
-  A. Stale file: an OLD tpm_client.py had been placed at tpm/client.py (top-level
-     `from common import EK_RSA_CERT_NV`, class TPMClient, no make_signer). Correct
-     tpm/client.py starts `from tpm.common import (b64d, b64e, sha256_hex, run,
-     mock_key, mock_ek_hash)` and ends with a make_signer() factory. ALWAYS verify the
-     first import line after copying files; and note the two-client.py collision
-     (tpm/client.py vs fl/client.py both download as client.py).
-  B. Model-size mismatch: real clients got "shape '[16,1,3,3]' is invalid for input of
-     size 6" because the server was still sending the 6-value stub. Root cause: server
-     running the OLD run_server.py. Fix: use the rewritten run_server.py (prints
-     "real MNIST model: 409034 parameters" as its first line in real mode).
-  C. HTTP body truncation on large payloads (net/agent.py chunked-read fix above).
-  D. filter.py empty-input crash on the all-honest eval sweep (already fixed Session 2,
-     still in force): classify() returns {} when gradients is empty.
-
-REAL-HARDWARE EK CERT (carried from Session 2, still true): the s4zz4d AMD fTPM HAS a
-fetchable EK cert (issuer AMD PRG-RN) that chain-verifies PRG-RN -> AMDTPM root;
-verify_ek_certificate returns True (via openssl fallback for AMD's non-spec cert).
-tpm/FETCH_EK_CERT.md documents the fetch procedure. To use real Tier 1 in deployment,
-set a client's tpm_backend="real" and load tpm/ca/amd_ftpm_ca.pem as the server's
-ca_bundle_pem; the mock runs above used Tier 2.
-
-RUN ORDER (real, over Tailscale), the working recipe:
-  0. All machines on ONE Tailscale account; `tailscale status` shows them all.
-  1. torch + torchvision installed on SERVER and all CLIENTS (server imports MNISTModel).
-  2. Same config.py on every machine (CLIENTS = the client IPs; NUM_CLIENTS = their count).
-  3. Each CLIENT: `PYTHONPATH=. python3 -m net.agent --label clientN --port 8470`
-     (omit --stub for real MNIST training; first start downloads MNIST). LEAVE RUNNING.
-  4. SERVER: `curl http://<clientIP>:8470/health` for each (expect {"ok":true}), then
-     `PYTHONPATH=. python3 run_server.py --rounds 5` (must print the 409034 line).
-  Networking gotchas seen: agents must stay running (own terminal, shows "listening");
-  ConnectionRefused = agent not running / wrong port; opaque 500 = client-side crash,
-  read the CLIENT agent terminal (now prints full traceback).
-
-STILL PENDING when this session ended: the user was mid-fix on bug B (replacing the
-OLD run_server.py on the SERVER with the rewritten one + installing torch on the
-server). Once the server prints "real MNIST model: 409034 parameters", real 2-client
-MNIST training over Tailscale should complete. After that: the live attack demo (one
-client sends poisoned updates to show a real flag+ban), real-TPM Tier-1 enrollment,
-and the beta-engine ablation eval run.
-
-A .gitignore was added that excludes EK/AK certs and keys (ek.crt, *.pem, *.key,
-tpm/ca/, results/audit.jsonl.key), generated outputs (results/, data/, *.csv, *.png),
-and Python/editor cruft. config.py is committed; force-add a sample CA bundle if you
-want it as a thesis artifact.
-
----
-## SESSION-2 UPDATE (latest — read this first; supersedes conflicting older notes)
-
-This project was set up and verified ON THE USER'S REAL LAPTOP this session.
-PIPELINE GREEN was achieved on hardware. Key new facts and changes:
-
-A. REAL TIER 1 ACHIEVED (major result). Contrary to the earlier assumption that the
-   AMD fTPM has no EK cert, the dev laptop (Ryzen 5 5600X) DOES expose a fetchable EK
-   certificate: issuer "Advanced Micro Devices, CN = PRG-RN", chaining PRG-RN ->
-   self-signed AMDTPM root. It chain-verifies in DLTF's own verify_ek_certificate
-   (returns True) and via `openssl verify` (ek.pem: OK). So the thesis can now
-   demonstrate a REAL Tier 1 node, not only the test-CA simulation. CA bundle saved at
-   tpm/ca/amd_ftpm_ca.pem (= PRG-RN intermediate + AMDTPM root, PEM). EK cert saved as
-   ek.crt (DER, 1262 bytes). Reframe the thesis claim accordingly:
-   "Tier 1 demonstrated on commodity AMD hardware with manufacturer-verified attestation."
-   NOTE: not all AMD fTPMs have this; it is board/BIOS dependent. Tier model still
-   degrades correctly to Tier 2 when the cert is absent.
-
-B. INTEROP FINDING (good viva material). AMD EK certs are technically malformed: a
-   non-spec DEFAULT encoding on an extension `critical` field. Python `cryptography`
-   (strict, Rust parser) REJECTS them with ParseError(EncodedDefault); openssl is
-   lenient and accepts them. Fix applied: tpm/common.py verify_ek_certificate now
-   falls back to `_verify_with_openssl` (shells `openssl verify -partial_chain`) when
-   the strict parser throws. Synthetic test-CA path still uses the strict parser.
-
-C. FILE FIXES applied this session (the corrected versions are the source of truth):
-   - tpm/client.py: _Tpm2Signer._try_ek_cert now calls
-     `tpm2_getekcertificate -u <ek.pub> -o <out> -X` (was missing -u, always failed).
-   - tpm/check_ek_cert.py: fetch_ek_cert now runs tpm2_createek THEN getekcertificate
-     with -u and -X; added a `--ek-cert <file>` flag to verify a saved cert without the
-     flaky live network fetch (AMD's PKI server is unreliable). Verification (chain
-     check) is NOT skipped by this flag; only the fetch is.
-   - tpm/common.py: openssl fallback (see B). PSS-aware _sig_ok also added.
-   - trust/filter.py: classify() now returns {} on empty input (crash fix: the eval
-     sweep, with no attackers and aggressive thresholds, banned ALL honest clients,
-     leaving updates empty -> np.stack([]) crashed). One-line guard added.
-   - fl/server.py: reputation_engine is now an injectable constructor arg
-     (default ReputationEngine), enabling the beta-engine ablation.
-
-D. NEW FILES this session:
-   - trust/reputation_beta.py: Bayesian beta engine, same interface, ablation arm
-     (hardware-informed priors Beta(8,2)/(4,2)/(2,2); tier-coupled forgetting; strike
-     policy EMERGES from the math). Added to tests/test_pipeline.py.
-   - run_server.py (project root): server-PC runner (build handles from config, enroll,
-     run rounds, write audit to results/audit.jsonl).
-   - tpm/FETCH_EK_CERT.md: step-by-step to fetch+verify an EK cert on any AMD client.
-   - tpm/ca/amd_ftpm_ca.pem, ek.crt: real-hardware artifacts (on the user's machine).
-
-E. FULL EVAL RAN on the user's machine (5 seeds, 30 rounds), all --check assertions
-   passed. Representative numbers: attacker cost per identity Tier1 ~0.86 vs Tier2 ~0.017
-   vs Tier3 ~0.003 (identities burned: ~7.8 Tier1 vs 30 Tier2/3 over 30 rounds);
-   rehab recovering 5/5 REINSTATED, persistent 0/5; sweep honest FPR 0.000 through
-   COSINE_MEDIAN_THRESHOLD -0.35, rising to 0.057 at -0.25 and 0.400 at -0.15 (so the
-   -0.45 default sits safely on the zero-FPR shelf). FoolsGold/NormClip FPR 0.000 across
-   their grids. NOTE: the value-arithmetic numbers above are from the ADDITIVE engine.
-
-F. COMMON SETUP GOTCHA: the two files both named client.py (tpm/client.py vs
-   fl/client.py) collide on download. The user hit ImportError because an OLD
-   tpm_client.py (top-level `from common import EK_RSA_CERT_NV`, class TPMClient, no
-   make_signer) had been placed at tpm/client.py. Correct tpm/client.py begins with
-   `from tpm.common import (b64d, b64e, sha256_hex, run, mock_key, mock_ek_hash)` and
-   ends with a make_signer() factory. Always verify that first import line after copying.
-
-G. CA ALLOW-LIST caveat (limitation to state): Tier 1 is only as sound as the trusted
-   CA bundle. A real cloud/VM TPM with a genuine vendor-signed EK cert WOULD verify if
-   that vendor CA is trusted; defense is to allow-list only intended manufacturer roots
-   (AMD/Intel/Infineon). Mass Tier-1 identities then require renting real attested VMs
-   = bounded by rental cost, consistent with the hardware-cost-bound claim.
----
-
-
-User context: Sazzad, CS undergraduate thesis at BRAC University, defending Summer 2026.
-Dev machine: Ryzen 5 5600X with AMD fTPM (which has NO fetchable EK certificate — this
-fact shaped the architecture). Communication style: terse, direct, wants short answers,
-tables, bottom-line first. House code style: no em dashes, ✓/✗ in prints, minimal
-comments, every module has a `__main__` self-test with assertions, code comments map
-features to objectives O1–O4.
+User: Sazzad, CS undergraduate thesis, BRAC University, defending Summer 2026.
+Style: terse, direct, bottom-line-first, tables over prose, wants short answers,
+corrects verbosity and factual/citation errors directly. House code style: no em
+dashes, ✓/✗ in prints, minimal comments, every module has a `__main__` self-test
+with assertions, comments map features to objectives O1–O4.
 
 ---
 
-## 1. Thesis objective
+## 1. What DLTF is
 
-DLTF (Decentralized Learning Trust Framework): a federated learning (FL) security
-system that decides how much to trust each client's gradient based on hardware-proven
-identity, sanctions misbehavior in a way attackers cannot escape by re-registering,
-and rehabilitates devices that provably reform.
+DLTF (Decentralized Learning Trust Framework): a federated-learning security
+system that decides how much to trust each client's gradient based on
+hardware-proven identity, sanctions misbehavior so attackers cannot escape by
+re-registering, and rehabilitates devices that provably reform.
 
-Four formal objectives (cited throughout the code):
-- **O1 Sybil resistance** — one TPM chip = one identity (credential activation).
-- **O2 Anti-whitewashing** — bans bind to the TPM's EK hash and survive re-registration.
-- **O3 Quantified trust** — deterministic reputation formula + measured attacker cost per tier.
-- **O4 Aggregator-agnostic** — trust layer outputs plain weight dicts consumed by any aggregator.
+Four objectives (cited throughout the code):
+- O1 Sybil resistance — one TPM chip = one identity (credential activation).
+- O2 Anti-whitewashing — bans bind to the TPM's EK hash, survive re-registration.
+- O3 Quantified trust — deterministic reputation formula + measured attacker cost.
+- O4 Aggregator-agnostic — trust layer outputs plain weight dicts.
 
-## 2. Problem being solved
-
-FL servers cannot verify who sends gradients. Attacks: **Sybil** (one machine, many fake
-clients), **poisoning** (malicious gradients), **sleeper** (behave, then attack),
-**whitewashing** (get banned, re-register fresh). Existing reputation systems fail
-because identities are free (Friedman & Resnick 2001, "The Social Cost of Cheap
-Pseudonyms" — the theoretical backbone). DLTF makes identity expensive to replace via
-TPM hardware, which makes negative reputation (bans) and rehabilitation meaningful.
-
-**The novelty is NOT detection** (crowded field; existing techniques used). The novelty:
-(a) hardware-rooted sanction-and-rehabilitation lifecycle, (b) the sanction policy
-itself is a function of hardware trust tier (identity replacement cost), (c) attacker
-cost per tier is quantified ("trust is priced").
-
-## 3. System architecture overview
-
-Five layers:
-1. **Identity (tpm/)** — TPM 2.0 enrollment: EK cert verification + credential activation → trust Tier.
-2. **Trust (trust/)** — detection (filter) → reputation (score/status/weights) → probation (rehab trials).
-3. **Learning (fl/)** — model, data, clients, server round loop, pluggable aggregators.
-4. **Transport (net/)** — handle abstraction: in-process (dev) or HTTP (LAN), switched by config.
-5. **Audit (audit/)** — tamper-evident hash chain of every trust decision.
-Plus **eval/** (Chapter 4 experiment harness) and **tests/** (pipeline capstone).
-
-**Trust tiers** (assigned at enrollment, drive ALL policy):
-| Tier | Proof | Weight cap | Strikes | Rehab |
-|---|---|---|---|---|
-| 1 HARDWARE | EK cert chains to manufacturer CA AND credential activation passes | 1.0 | 2 MAJOR | Yes |
-| 2 TPM_RESIDENT | Activation only (swtpm passes this). NOTE: the user's AMD fTPM DOES have a cert and reaches Tier 1; see Session-2 Update A | 0.5 | 1 | No |
-| 3 SOFTWARE | Nothing proven (TOFU) | 0.1 | 1 | No |
-
-Core idea: identity replacement cost determines policy. Expensive identities (Tier 1)
-get patience and rehabilitation; free identities get low caps and instant bans.
-
-## 4. Folder structure
-
-```
-dltf/
-├── config.py                  # MODE local/real switch, CLIENTS list (the ONE deploy knob)
-├── run_server.py              # server-side runner: builds RemoteClientHandles from
-│                              #   config, enrolls agents, runs rounds, writes audit
-├── README.md
-├── requirements.txt
-├── setup.sh                   # scaffold generator
-├── tpm/
-│   ├── FETCH_EK_CERT.md       # step-by-step EK cert fetch+verify for new AMD clients
-│   ├── ca/amd_ftpm_ca.pem     # real AMD CA bundle (PRG-RN + AMDTPM root) [on user machine]
-│   ├── common.py              # Tier enum (canonical), assess_tier, EK cert verify,
-│   │                          #   make_credential, test CA generator
-│   ├── client.py              # TPMSigner backends: mock / swtpm / real + factory
-│   └── check_ek_cert.py       # standalone machine diagnostic: which tier can this box reach
-├── trust/
-│   ├── reputation.py          # THE CONTRIBUTION: additive engine, tier-coupled policy
-│   ├── reputation_beta.py     # ablation arm: Bayesian beta engine, same interface
-│   ├── probation.py           # rehabilitation trials (shadow model, OLS slope)
-│   └── filter.py              # detection: 4 stages, existing techniques
-├── fl/
-│   ├── model.py               # MNIST CNN, flat list[float] param interface (torch)
-│   ├── dataset.py             # non-IID MNIST partition (numpy core, lazy torch)
-│   ├── client.py              # FLClient shell + TorchTrainer
-│   ├── aggregator.py          # fedavg / trimmed_mean / krum (O4)
-│   └── server.py              # FederatedServer: enrollment + round lifecycle
-├── net/
-│   ├── handles.py             # LocalClientHandle / RemoteClientHandle (the seam)
-│   └── agent.py               # HTTP agent run on each client PC
-├── audit/
-│   └── hashchain.py           # HMAC-signed hash chain, JSONL persistence
-├── eval/
-│   ├── scenarios.py           # synthetic world, attacker behaviors, baseline server
-│   ├── run_experiments.py     # Chapter 4 CSVs + summary + --check assertions
-│   └── plot_results.py        # 8 thesis figures from CSVs
-├── tests/
-│   └── test_pipeline.py       # one command, whole stack verified
-├── data/                      # MNIST download target
-└── results/                   # CSVs, summary.txt, figs/
-```
-
-## 5–6. Purpose of every folder and file
-
-(See tree annotations above; expanded reasoning:)
-
-- **tpm/common.py** — identity root. `assess_tier(cert_ok, activation_ok)` is the tiering
-  policy. `verify_ek_certificate` = real X.509 chain verification (cryptography lib) —
-  the ONLY check distinguishing real silicon from software TPM. `make_credential` =
-  server-side challenge (mock path = HMAC-sealed; real path shells `tpm2_makecredential
-  -T none`). `generate_test_ca`/`issue_ek_cert` mint Tier-1 mock devices for experiments.
-- **tpm/client.py** — client side. `MockTPMSigner` (deterministic per label, dev),
-  `SwtpmSigner`/`RealTPMSigner` (tpm2-tools sequences incl. endorsement-policy session
-  for activatecredential; machine-side only). `make_signer(backend, ...)` factory.
-- **trust/reputation.py** — additive engine. R starts 100; deltas POSITIVE +5, NEUTRAL 0,
-  MINOR −10, MAJOR −25, CRITICAL −60. PROBATION_R=50, BAN_R=20, PROBATION_WEIGHT_CAP=0.1.
-  POLICY dict keyed by Tier (cap / major_to_probation / rehab). weight = cap·R/100.
-  Bans recorded against EK hash; `register()` returns BANNED for known-banned EKs (O2).
-- **trust/reputation_beta.py** — Bayesian alternative, SAME interface. T=(a0+s)/(a0+s+b0+f).
-  Priors by tier: (8,2)/(4,2)/(2,2). Evidence: clean round +1 good; MINOR/MAJOR/CRITICAL
-  = 1/3/8 bad. Thresholds T≤0.5 probation, T≤0.3 or CRITICAL ban. Novel: hardware-informed
-  priors (strike policy EMERGES from math: Tier-1 hits 0.5 at exactly 2nd MAJOR), and
-  tier-coupled forgetting (λ=0.95 Tier-1 only, applied only on clean rounds).
-  Swap via `FederatedServer(..., reputation_engine=BetaReputationEngine())`.
-- **trust/probation.py** — Tier-1-only rehab. Suspect's updates feed an ISOLATED shadow
-  model from a frozen snapshot; reinstatement requires OLS slope ≥ 0.005 over an
-  HMAC-randomized window [4,9] (salt = os.urandom per process so attackers can't time
-  it); 0.001–0.005 → one-shot 3-round extension; else PERMANENT_BAN. Duck-typed engine
-  interface (reinstate / record_event).
-- **trust/filter.py** — detection, max-severity composition: Stage1 norm > 2.5× median
-  → MINOR; Stage2 cosine to LEAVE-ONE-OUT median of prior-trusted contributors < −0.45
-  → MAJOR; Stage3 FoolsGold-style current-round pairwise sim ≥ 0.95 sustained 2 rounds
-  → CRITICAL; Stage4 self-history cosine < −0.45 sustained 2 rounds → MAJOR.
-- **fl/server.py** — integration point. `enroll(handle)`: payload → cert verify →
-  MakeCredential challenge → activation check → assess_tier → rep.register → audit.
-  `run_round`: collect updates → filter.classify(prev round's weights) →
-  rep.record_event → probation enter/step → get_all_weights → aggregate → apply → audit.
-  Talks ONLY to duck-typed handles (device_label, tpm_backend, enroll_payload,
-  activate_credential, train).
-- **fl/aggregator.py** — all aggregators consume (updates dict, weights dict) → flat list.
-  Banned devices absent from weights ⇒ structurally excluded. Krum uses weights as
-  eligibility mask (O4: trust plugs into averaging AND selection aggregators).
-- **fl/model.py** — ~409k-param CNN; flat get/set_parameters; NO dropout/batchnorm/momentum
-  so the local-training delta is a clean gradient proxy. Self-test NOT yet run (needs torch).
-- **fl/dataset.py** — contiguous class blocks per client + 10% leak; stratified 50/class
-  validation held out for the shadow model. Numpy core tested; torch loaders lazy.
-- **run_server.py** — server-PC entry point for LAN/internet runs: reads
-  config.CLIENTS, builds RemoteClientHandles, enrolls all agents, runs N rounds,
-  prints weights/flags per round, writes audit to results/audit.jsonl. (Created at
-  wrap-up; lives in /mnt/user-data/outputs, must be placed in project root.)
-- **net/handles.py / net/agent.py** — the local↔LAN seam. Agent routes: GET /health,
-  POST /enroll /activate /train (JSON, base64 binaries, plain HTTP). Run:
-  `python3 -m net.agent --label client1 --port 8470 [--stub]`.
-- **audit/hashchain.py** — entries {seq, ts, type, payload, prev, hash, sig};
-  hash=SHA256(canonical body), sig=HMAC-SHA256(key, hash); JSONL + sidecar .key file;
-  refuses to load tampered files. Server writes ENROLL, WHITEWASH_REJECTED, EVENT
-  (non-neutral), BAN (with EK hash — the O2 evidence), PROBATION_ENTER/DECISION, ROUND.
-- **eval/scenarios.py** — SyntheticWorld: target direction t; accuracy proxy =
-  max(0, 0.5(1+cos(p,t)))·(1−e^(−||p||/25)) (cosine term catches direction attacks,
-  norm term catches dilution). Behaviors: honest (t + 0.5·noise), sybil (identical
-  orthogonal-side updates), poisoner/sleeper (−t after start), recovering/persistent.
-  BaselineServer = plain FedAvg, accepts everything, equal weights (control arm).
-  Validity argument: trust layer sees only vectors, so trust-layer claims are
-  substrate-independent; MNIST runs (machine-side) report end-model accuracy.
-- **eval/run_experiments.py** — experiments: accuracy (DLTF vs baseline × 4 attacks),
-  detection latency, whitewash, cost (attacker re-mints identity on every ban; counts
-  identities + weight-rounds injected per tier), rehab (ADAPTIVE attacker: attacks
-  until probation, then reforms or persists), sweep (threshold grids vs FPR/latency).
-  `--check` asserts headline claims. CLI: `--exp all --seeds 5 --rounds 30 --out results --check`.
-- **eval/plot_results.py** — 8 PNGs (accuracy 2×2, detection, whitewash, cost, rehab, 3 sweeps).
-- **tests/test_pipeline.py** — runs all 14 module self-tests as subprocesses,
-  py_compiles 4 machine-side files, end-to-end HTTP+audit smoke, eval whitewash smoke.
-  `PYTHONPATH=. python3 tests/test_pipeline.py` → "✓ PIPELINE GREEN".
-
-## 7. End-to-end workflow
-
-Enrollment (once): agent provisions EK+AK → sends ek_hash/ak_name/cert → server verifies
-cert chain → sends MakeCredential blob → agent answers via ActivateCredential → server
-compares secret → tier assigned → reputation.register(label, tier, ek_hash) → audit ENROLL.
-
-Per round: server broadcasts params → clients train locally, return deltas → filter
-classifies (severity per client) → reputation records events (status/weight updates) →
-new PROBATION devices enter shadow trials; trials step; verdicts reinstate or perma-ban →
-aggregator merges updates with trust weights → global model += aggregate → audit ROUND.
-
-## 8. Data flow (text diagram)
-
-```
-client agent ──train──► delta ──HTTP/JSON──► FederatedServer
-                                              │
-                                              ▼
-                                   filter.classify ──severity──► reputation.record_event
-                                              │                        │ status, weights
-                                              ▼                        ▼
-                                   probation.step ◄──suspects── get_all_weights
-                                       │ verdicts                      │
-                                       ▼                               ▼
-                                 reinstate/ban                aggregator(updates, weights)
-                                                                       │
-                  audit.hashchain ◄── every decision ──────────────────┤
-                                                                       ▼
-                                                          global_params += aggregate
-```
-
-## 9. Module interaction & security mechanisms
-
-- Credential activation = the O1 mechanism (only the EK-holding TPM can decrypt the challenge).
-- EK certificate chain = the ONLY real-silicon proof; swtpm passes activation for free,
-  hence it can never exceed Tier 2 (honest security boundary).
-- Leave-one-out reference median = attacker cannot dilute the reference it is scored against.
-- Sustained requirements (FoolsGold 2 rounds, temporal 2 rounds) = single noisy rounds
-  never burn one-strike identities.
-- Probation window HMAC-randomized = "behave just long enough" timing attacks blocked.
-- Shadow model isolation = honest federation's improvement cannot mask a bad actor.
-- Hash chain HMAC = file access without the key cannot re-mint a consistent audit log.
-- Module coupling: reputation imports Tier from tpm.common (canonical); probation and
-  server use duck typing; severities are plain strings ("MAJOR" etc.) matching EventTier names.
-
-## 10 & 12. Blockchain / smart contract status — IMPORTANT HONESTY NOTE
-
-An EARLIER project iteration used Polygon Amoy testnet with a `DLTFRegistry.sol`
-contract and `polygon_connector.py`. The clean rebuild (this codebase) REPLACED that
-with `audit/hashchain.py`: a local append-only HMAC-signed hash chain. Rationale: the
-thesis needs tamper-EVIDENT, offline-verifiable trust records, not consensus; a public
-chain added cost/complexity without strengthening the claims. There are NO smart
-contracts in the current codebase. Framing for the thesis: hashchain = the audit layer;
-publishing the head hash to a public chain is stated future work (one-line bridge).
-Do not reintroduce blockchain unless the user explicitly asks. If asked, the agreed
-scope is a thin ANCHOR only: a new audit/anchor.py that periodically writes the hash
-chain's head hash to a minimal contract on Polygon Amoy (~1-2 days, zero trust-system
-changes), upgrading the claim from tamper-evident to publicly tamper-proof. Putting
-per-round reputation/bans on-chain was evaluated and rejected (gas cost, latency, new
-failure modes, no added proof).
-
-## 11. Federated Learning components
-
-FedAvg (weighted), Krum, TrimmedMean in aggregator.py. MNIST CNN (2 conv + 2 FC,
-409,034 params). Non-IID: contiguous class blocks + 10% leak. Plain SGD, 1 local epoch,
-lr 0.05 default, no momentum (delta = gradient proxy). 5 LAN clients planned; eval
-simulates ~10 synthetically.
-
-## 13. Trust model
-
-Server is trusted (centralized FL). Clients untrusted. TPM manufacturer CAs trusted as
-roots. Mock backend trusts nothing (dev only). Tier table in §3 IS the trust model:
-trust granted proportional to hardware proof; policy strictness inversely proportional
-to identity replacement cost.
-
-## 14. Threat model
-
-In scope: Sybil (caught Stage 3, CRITICAL), blatant/targeted poisoning (Stage 2),
-scaling (Stage 1), sleeper (Stage 2/4), whitewashing (EK-bound bans), probation gaming
-(randomized window, isolated shadow). Out of scope / limitations: TPM physical attacks,
-compromised manufacturer CA, server compromise, network MITM (no TLS on LAN testbed),
-gradient inversion privacy attacks, subtle below-threshold poisoning (sweep maps the boundary).
-
-## 15. Dependencies
-
-Python 3.10+. numpy (trust/eval), cryptography ≥ 41 (X.509, test CA), matplotlib (plots),
-torch + torchvision (fl/model, real training ONLY — everything else runs without),
-tpm2-tools (machine-side real/swtpm). Stdlib elsewhere (http.server, urllib, hmac,
-hashlib, csv, statistics). pip installs need `--break-system-packages` on Ubuntu 24.
-
-## 16. Configuration
-
-`config.py`: MODE = "local" | "real"; CLIENTS = list of {device_label, tpm_backend
-("mock"/"swtpm"/"real"), tcti, endpoint}; NUM_CLIENTS=5. Local→LAN = edit MODE, fill 5
-IPs, set tpm_backend="real", run net/agent.py on each box. Suggested addition (not yet
-wired): REPUTATION_ENGINE = "additive" | "beta" passed through to FederatedServer and
-eval/scenarios.py build() for a pure-config ablation flip.
-
-## 17. Storage
-
-No database. In-memory engine state (restart = re-enroll; accepted prototype limitation).
-Audit: JSONL + .key sidecar. Eval: CSVs + summary.txt + PNGs in results/. MNIST in data/.
-
-## 18. APIs / network
-
-Agent HTTP API (JSON, base64 binaries): GET /health; POST /enroll → provision payload;
-POST /activate {blob} → {secret}; POST /train {round, params} → {update, num_samples}.
-Timeouts 30s (600s for train). Plain HTTP, trusted LAN assumption (limitation).
-
-## 19. Deployment
-
-Dev: everything in-process via LocalClientHandle (one PC plays server and all clients).
-
-LAN: server PC runs `PYTHONPATH=. python3 run_server.py --rounds N` (builds
-RemoteClientHandles from config, enrolls, loops rounds, audit to results/audit.jsonl);
-each client PC opens port 8470 (`sudo ufw allow 8470`) and runs
-`PYTHONPATH=. python3 -m net.agent --label clientN --port 8470 [--stub]`.
-config.py must be identical on all machines (labels must match agent --label flags).
-Recommended bring-up order: tpm_backend="mock" + --stub agents (network smoke test),
-then drop --stub (real MNIST training; first start downloads MNIST), then
-tpm_backend="real" on TPM-equipped boxes (verify tier with `python3 -m tpm.check_ek_cert`).
-Agents partition MNIST identically (same seed) and take their own shard — no data
-distribution step.
-
-INTERNET deployment (machines NOT on one LAN): zero code changes. Home routers/CGNAT
-(common with Bangladeshi ISPs) block direct inbound connections, so use Tailscale
-(free WireGuard mesh VPN): install + `sudo tailscale up` on every machine under one
-account, each gets a stable 100.x.y.z IP (`tailscale status`), put those IPs in
-config.py endpoints. No port forwarding or router config needed. Side benefit for the
-thesis: all agent traffic is then WireGuard-encrypted, mitigating the "plain HTTP, no
-TLS" limitation in deployment — state this in the limitations section. Expect slower
-rounds than LAN (the 600s train timeout already accommodates this). Avoid the
-VPS + port-forwarding alternative; CGNAT usually defeats it.
-
-## 20. Testing methodology
-
-Every module: `__main__` self-test with assertions (run `PYTHONPATH=. python3 <file>`).
-Capstone: `PYTHONPATH=. python3 tests/test_pipeline.py` (subprocess-isolated module
-tests + compile checks + HTTP/audit e2e + eval smoke). Eval has `--check` asserting
-headline claims. Verified results (3 seeds, 25 rounds, synthetic):
-- No attack: DLTF 0.620 = baseline 0.620 (defense costs nothing).
-- Under attack: DLTF 0.614–0.618 vs baseline 0.460–0.521.
-- Detection ≤ 1 round; whitewash blocked 15/15 (baseline 0/15).
-- Attacker cost: 0.906 weight-rounds/identity Tier-1 (price: physical TPM) vs 0.021
-  Tier-2 (free) vs 0.004 Tier-3 — "trust is priced" (O3).
-- Rehab: recovering 3/3 REINSTATED; persistent 0/3.
-- Sweep: honest FPR 0.000 at default −0.45, cliffs to 0.095/0.334 at −0.35/−0.25.
-
-DONE on the user's machine: full pipeline (PIPELINE GREEN), full eval 5seeds/30rounds
-(all --check passed), real Tier-1 EK cert verification on the AMD fTPM.
-STILL PENDING machine-side: fl/model.py self-test (needs torch), full MNIST accuracy
-runs (synthetic substrate used so far), swtpm/real signer enrollment end-to-end,
-beta-engine ablation eval run, live multi-PC / Tailscale demo.
-
-## 21. Known limitations (state ALL in thesis)
-
-X.509 path validation simplified (name chain + signatures; no revocation/full RFC 5280/EK
-profile OIDs). No TLS/auth on the HTTP transport itself (mitigated in internet deployment by running over Tailscale/WireGuard; request-level auth still future work). AMD fTPMs cap at Tier 2 (no fetchable EK cert) —
-hardware-rooted bans only where verifiable certs exist; claim is "whitewashing becomes
-hardware-cost-bound", NEVER "impossible". Audit log centralized (verifiable, not
-consensus). In-memory state. Synthetic substrate for trust metrics (MNIST machine-side).
-Small federation (5 LAN / ~10 simulated). Constants are design parameters (see §23).
-FoolsGold variant simplified — cite as "FoolsGold-style".
-
-## 22. Future improvements
-
-Config-driven engine ablation wiring; MNIST eval substrate plug; TLS + request auth;
-posterior lower-confidence-bound (subjective logic uncertainty) in beta engine; public
-anchor for audit head hash; persistence/restart recovery; larger federations; full
-RFC 5280 validation.
-
-## 23. Important implementation decisions (and bugs fixed — defense gold)
-
-1. Old scripts were security theater: tpm2_checkquote proves signature math only;
-   device ID = SHA256(EK_pub) is attacker-chosen; same-machine "binding" checks prove
-   nothing. Rebuilt around the only two real mechanisms: EK cert chain + credential activation.
-2. Tiered graceful degradation instead of demanding certs (would reject user's own AMD box).
-3. Constants derivation (supervisor asked): scale 0–100 arbitrary (ratios matter); each
-   value derived from a stated rule — "2 majors → probation" ⇒ MAJOR=−25 (100−50=2×25);
-   "5 minors ≈ 2 majors" ⇒ MINOR=−10; "one chance after probation" ⇒ BAN=20; "trust
-   falls 5× faster than it rises" ⇒ POSITIVE=+5 (asymmetry principle: Slovic 1993,
-   CONFIDANT 2002); graduated sanctions: Ostrom 1990; cheap-pseudonym result: Friedman
-   & Resnick 2001. Sweep shows robustness to exact values.
-4. Bugs found during build (tell this story in the defense):
-   a. Cumulative-history FoolsGold falsely flagged honest correlated clients → switched
-      to current-round pairwise + sustained counter.
-   b. Stage-4 single-round temporal check fired on ~20% of honest client-rounds at
-      realistic SNR → sustained-2 requirement + threshold −0.45.
-   c. Self-inclusion in the reference median let attackers dilute their own deviation
-      score → leave-one-out reference.
-   d. Probation salt (os.urandom per process) made a server test flaky → tests pin the
-      salt; recovering poisoner given seeded noise.
-5. Eval rehab uses an ADAPTIVE attacker (attacks until sanctioned, then reforms) —
-   conditions the experiment on probation entry, which is the question rehab answers.
-6. Detection thresholds: −0.45 cosine defended EMPIRICALLY by the sweep FPR cliff.
-7. Two reputation engines, one interface = ablation ("structure, not arithmetic, drives
-   the defense"). Beta engine novelty: hardware-informed priors (strike policy emerges
-   from math), tier-coupled forgetting (only on clean rounds, only Tier 1).
-
-## 24. Glossary
-
-TPM (security chip), EK (Endorsement Key — permanent chip-bound key = silicon
-fingerprint), EK certificate (manufacturer-signed proof of genuine chip), AIK/AK
-(attestation key), MakeCredential/ActivateCredential (challenge only the EK-holder's
-TPM can answer), swtpm (software TPM emulator), fTPM (firmware TPM), Sybil/whitewashing/
-sleeper (attacks, §2), FedAvg (weighted averaging), Krum (selects most-consensual
-update), non-IID (skewed per-client data), shadow model (isolated copy trained only on
-a suspect's updates), EK hash (SHA256 of EK public = identity fingerprint), TOFU
-(trust on first use), weight-rounds (Σ of aggregation weight over rounds = influence bought).
-
-## 25. Defense explanation in simple language
-
-"Imagine an online classroom where students submit homework that gets merged into one
-shared answer. Cheaters can join with fake names, submit garbage, and when caught,
-rejoin under a new name. Our system checks each student's ID card at the door — a chip
-soldered into their computer that can't be faked or copied. Students with a
-manufacturer-verified chip get full voting power and, because we'd recognize them
-forever, we can afford to give them second chances: if they misbehave, they enter a
-supervised trial where only their own work is graded, and they're readmitted only if it
-measurably improves. Students with weak or no ID get little voting power and one
-strike, because banning a free identity means nothing — they'd just come back. The key
-insight: how much you trust someone, and how you punish them, should depend on how
-expensive their identity is to replace. We measured it: a fake-ID attacker buys almost
-zero influence per identity; a real-chip attacker buys 43× more but must purchase a new
-physical chip every time we ban them. And honest classrooms lose nothing — with no
-cheaters present, our system performs identically to having no security at all."
+Novelty (NOT detection — that uses existing techniques): (a) hardware-rooted
+sanction-and-rehabilitation lifecycle, (b) the sanction policy itself is a
+function of hardware trust tier (identity replacement cost), (c) attacker cost
+per tier is quantified.
 
 ---
 
-## Quick-start commands for the next session
+## 2. Live deployment state
 
-```
-PYTHONPATH=. python3 tests/test_pipeline.py                                   # verify all
-PYTHONPATH=. python3 -m eval.run_experiments --exp all --seeds 5 --rounds 30 --out results --check
-PYTHONPATH=. python3 -m eval.plot_results --results results
-PYTHONPATH=. python3 -m net.agent --label client1 --port 8470 --stub          # client agent
-PYTHONPATH=. python3 run_server.py --rounds 10                                # server runner
-# internet deployment: tailscale up on all machines, use 100.x IPs in config
-python3 -m tpm.check_ek_cert                                                  # tier diagnostic
-```
+WORKING: 3 physical machines on a Tailscale WireGuard mesh (account tpm97510@),
+all Ryzen boxes with AMD firmware TPMs:
+- 100.95.144.127 (ubuntu)    → SERVER (runs run_server.py; NOT in CLIENTS list)
+- 100.70.28.2   (s4zz4d HP)  → client1 (runs net/agent.py)
+- 100.73.178.45 (tafsir HP)  → client2 (runs net/agent.py)
 
-Engine swap: `FederatedServer(params, reputation_engine=BetaReputationEngine())`
-(default = additive `ReputationEngine`).
+ACHIEVED: Both clients enroll as real Tier 1 (HARDWARE) with DISTINCT EK hashes
+(client1 ac6971…, client2 e7c273…), confirming one-chip-one-identity (O1). Real
+409,034-param MNIST model is sent by the server. Round loop runs over real HTTP.
+Audit chain writes to results/audit.jsonl.
+
+Deployment facts:
+- Tailscale is required (Bangladeshi CGNAT blocks direct inbound). All machines
+  must be on ONE Tailscale account or only some appear in `tailscale status`.
+- The SERVER dials OUT to clients on port 8470; clients never dial the server,
+  so the server's own IP is not in config.CLIENTS.
+- torch + torchvision needed on SERVER and all CLIENTS (server imports MNISTModel).
+- Traffic is WireGuard-encrypted, mitigating the plain-HTTP limitation.
+
+Run order (real, over Tailscale):
+  0. All machines on one Tailscale account; `tailscale status` shows all three.
+  1. Each CLIENT: `PYTHONPATH=. python3 -m net.agent --label clientN --port 8470`
+     (no --stub for real MNIST; first start downloads MNIST). LEAVE RUNNING.
+  2. SERVER: `curl http://<clientIP>:8470/health` each (expect {"ok":true}), then
+     `PYTHONPATH=. python3 run_server.py --rounds 5` (must print "real MNIST
+     model: 409034 parameters").
+
+---
+
+## 3. TPM / hardware attestation — RESOLVED
+
+Both clients reach real Tier 1. Certs live per-machine in `cert/` (each chip has
+its OWN cert; certs are NOT shared between machines). Verified chain:
+EK cert → AMD intermediate → AMD root; `verify_ek_certificate` returns True.
+
+Key facts and fixes already applied:
+- Cert is read from disk (`cert/ek.crt`), NOT live-fetched at enroll time. AMD's
+  PKI live-fetch is flaky and returned a different (failing) 1262-byte cert.
+  `_try_ek_cert` in tpm/client.py now reads the on-disk cert first, fetch is only
+  a fallback.
+- `run_server.py` loads `tpm/ca/amd_ftpm_ca.pem` as the server's `ca_bundle_pem`
+  and passes it to FederatedServer (without this, cert_ok is always False → all
+  Tier 2).
+- CA bundle must contain the RIGHT intermediate. AMD chips chain through
+  different intermediates: client certs use CN=PRG-RN, but the original bundle
+  only had CN=PRG-SSP. Bundle now includes BOTH intermediates + AMDTPM root, so
+  the server trusts any AMD chip chaining through either.
+- `verify_ek_certificate` (tpm/common.py): tries the strict Rust X.509 parser
+  first, falls back to `openssl verify -partial_chain` on ANY failure (parse OR
+  chain-walk), because AMD certs are technically malformed (non-spec DEFAULT
+  encoding on a critical field) AND chain via partial_chain. Both paths needed.
+
+Enrollment tier gate (fl/server.py): tier is HARDWARE only if
+`cert_ok = (cert present) AND (ca_bundle loaded) AND verify_ek_certificate()`
+AND credential activation passes. The tier the SERVER assigns depends on what the
+AGENT provisions (its tpm_backend), not on files sitting in cert/. config.py
+must set `tpm_backend: "real"` and `tcti: "device:/dev/tpmrm0"` for a client to
+present its cert.
+
+Diagnostic: `check_tiers.py` (project root) enrolls both clients and prints tier
+only, no training — use this to verify tiers before any training run.
+
+DATA MODEL (enrollment, JSON over HTTP, binary fields base64):
+  ek_cert    ≜ ⟨EK_pub, issuer, validity, manufacturer_sig⟩
+  provision  ≜ ⟨device_label, ek_hash, ak_name, ek_cert, ek_pub⟩  (POST /enroll)
+  challenge  ≜ ⟨blob⟩  where blob = MakeCredential(ek_pub, secret) (POST /activate)
+  response   ≜ ⟨secret'⟩  where secret' = ActivateCredential(blob)
+  identity   ≜ ⟨device_label, ek_hash, tier, status⟩
+  ek_hash = SHA256(EK_pub) is the identity fingerprint; bans bind to it (O2).
+
+---
+
+## 4. Reputation engine — FINALIZED (trust/reputation.py)
+
+Bayesian engine in subjective-logic form (Josang 2001; Josang & Ismail 2002),
+tier-coupled policy. Class name ReputationEngine. Exports Status, EventTier,
+PROBATION_WEIGHT_CAP unchanged.
+
+TRUST SCORE (identical to Josang's probability expectation E = b + a·u):
+
+    T = (α₀ + s) / (α₀ + β₀ + s + f)
+
+s = accumulated good evidence, f = accumulated bad evidence, (α₀, β₀) = tier
+prior. Opinion (b, d, u, a) is also exposed: b = s/n, d = f/n, u = (α₀+β₀)/n,
+a = α₀/(α₀+β₀), where n = α₀+β₀+s+f. u is the sample-size term (shrinks as
+evidence grows). Aggregation weight w = cap(tier)·T, 0 if banned.
+
+THE DERIVATION CHAIN (every constant is [CITED] / [DERIVED] / [ENG], nothing
+picked arbitrarily — this is the answer to the supervisor's "why these numbers"):
+
+  β₀ = 2 (all tiers)     [CITED] Josang non-informative prior weight. Identity
+                         proof ≠ behavioral proof, so doubt never shrinks by tier.
+  w(MINOR) = 1           [CITED] one observation = one count.
+  w(MAJOR) = 3           [DERIVED] noise separation: detector's sustained window
+                         is 2 rounds, so 2 spurious MINORs must stay below 1
+                         deliberate MAJOR; minimal integer with 2·1 < w.
+  α₀(Tier1) = β₀+2w = 8  [DERIVED] policy P1: fresh Tier-1 hits probation
+                         (T≤0.5) at EXACTLY its 2nd MAJOR. Start trust 0.80 is an
+                         OUTPUT of this, not chosen.
+  α₀(Tier2) = 8/2 = 4    [DERIVED] activation-only earns half the credit (mirrors
+                         0.5 cap). Verified: banned by 1 MAJOR (4/10=0.4),
+                         survives 1 MINOR (4/7=0.57).
+  α₀(Tier3) = β₀ = 2     [CITED] insufficient reason, a=0.5. Zero tolerance
+                         EMERGES: 1 MINOR → 2/5 = 0.40 ≤ 0.5.
+  K = α₀+β₀; memory N=K  [DERIVED] rule: prior mass and memory are the same
+                         currency (rounds), set equal. → γ = 1−1/K,
+                         T_max = 1−1/K.
+  θ_probation = 0.5      [CITED] indifference point; Kang trusted-worker threshold.
+  θ_reinstate = 0.55     [DERIVED] survives one noise unit: 0.5·(1+1/K₁).
+  θ_ban = 0.3            [ENG, sweep] backstop; probation fires first on every
+                         reachable path (6 MINORs vs 17). Value immaterial.
+  CRITICAL               [DERIVED] a RULE not a weight: confirmed Sybil evidence
+                         is identity abuse; any finite weight would let banked
+                         history offset it. Bans non-compensably. (Old dead
+                         weight of 8 removed.)
+  M3 = 2 consec MAJORs   [DERIVED] banked history buys weight not strikes;
+                         veteran strike budget = fresh budget from P1.
+  FORGIVE_AFTER = 5      [DERIVED] probation W_min + 1.
+  FORGET = 0.95 (T1 only)[ENG, sweep] distrust fades at half trust's decay rate:
+                         1−(1−γ₁)/2 (Slovic asymmetry). T2/T3 = 1.0 (never).
+
+CURRENT CONSTANT VALUES (verified from code):
+  PRIORS  HARDWARE (8,2)  TPM_RESIDENT (4,2)  SOFTWARE (2,2)
+  Start T   0.80             0.667               0.50
+  K = N     10               6                   4
+  γ         0.900            0.8333              0.750
+  T_max     0.90             0.833               0.75
+  cap       1.0              0.5                 0.1
+  strikes   2 MAJOR          1 MAJOR             any
+  rehab     yes              no                  no
+  BAD_EVIDENCE = {MINOR:1, MAJOR:3}   (CRITICAL is a rule, not in this dict)
+  θ_p 0.5 | θ_r 0.55 | θ_b 0.3 | FORGIVE_AFTER 5 | FORGET{HW:0.95}
+
+HARDENING MECHANISMS:
+  M1 bounded recency: s ← γ·s + 1 each round, saturates at 1/(1−γ)=K, so a
+     sleeper cannot bank unbounded cushion.
+  M2 earned asymmetric forgetting: f is sticky, never decays round-by-round;
+     fades (×0.95) only after 5 consecutive clean rounds, only for Tier 1. One
+     good round launders nothing — defeats on-off attacks.
+  M3 sustained escalation: 2 consecutive MAJORs → probation/ban bypassing the
+     score, so a high-s veteran sleeper is caught even when its score is >0.5
+     (e.g. saturated veteran's 2nd MAJOR: T=0.663 but M3 fires).
+
+METHODS: register(id,tier,ek_hash) / record_event(id,severity) /
+reinstate(id, trial_rounds=0) / get_status / get_weight / get_all_weights /
+get_opinion(id) → (b,d,u,a) / rank(ids=None) → Josang Def.10 ordering (highest
+T first, ties broken by least uncertainty u) / banned_ek_hashes.
+
+---
+
+## 5. Probation engine — FINALIZED (trust/probation.py)
+
+Tier-1-only rehabilitation. A probated client's updates train an ISOLATED shadow
+model (frozen global snapshot + only that client's gradients). Reinstatement is
+decided by the OLS slope of the shadow model's accuracy over the trial.
+
+  REINSTATE_SLOPE = 0.005  → REINSTATED (calls rep.reinstate with trial rounds)
+  EXTEND_SLOPE = 0.001     → one-shot EXTENDED (+3 rounds), else PERMANENT_BAN
+  WINDOW = HMAC(device_id, entry_round) ∈ [4, 9]  [DERIVED] 4 = OLS sign-stability
+     floor, 9 = K₁−1 (resolve within trust memory). HMAC salt = os.urandom per
+     process, so "behave just long enough" timing attacks are blocked.
+
+SLOPE→REPUTATION COUPLING (supervisor's request, now wired): the slope decides
+the BRANCH; the passed trial rounds are forwarded to rep.reinstate(id,
+trial_rounds=len(accuracy_series)) as EARNED EVIDENCE (s += trial_rounds) before
+the θ_r=0.55 floor. So a longer/stronger proven recovery returns with
+proportionally higher trust (e.g. 9-round recovery → 0.680 vs 6-round → 0.636).
+No new constants. Duck-typed engine interface (reinstate, record_event); module
+self-tests standalone.
+
+---
+
+## 6. Worked example (real engine output, for intuition)
+
+  Honest T1: enroll 0.80 → climbs slowly toward 0.90 (s saturates ~10).
+  Two MAJORs: 0.80 → 0.615 → 0.500 (probation at exactly 2nd, weight drops to 0.05).
+  Tier-2 MINOR then MAJOR: 0.667 → 0.571 (survives) → 0.400 (BANNED, no rehab).
+  Sleeper (30 clean then attack): banks 0.898, MAJOR#1→0.769, MAJOR#2→0.663
+    (score >0.5 but M3 fires → probation).
+  On-off (MAJOR then clean spam): f stays 3.0 through 4 clean rounds (not
+    laundered), fades only after the 5th.
+  Probation trial: shadow acc 0.52→0.62, slope +0.02 ≥ 0.005 → REINSTATED at
+    T=0.636 (0.55 floor + 5 trial rounds credited).
+
+---
+
+## 7. Architecture (5 layers + eval + tests)
+
+  tpm/     identity: EK cert verify + credential activation → tier
+  trust/   reputation.py (above), probation.py (above), filter.py (detection)
+  fl/      model (MNIST CNN 409k params), dataset (non-IID), client, aggregator
+           (fedavg/krum/trimmed_mean), server (enroll + round lifecycle)
+  net/     handles.py (local↔remote seam), agent.py (per-client HTTP agent)
+  audit/   hashchain.py (HMAC-signed tamper-evident JSONL chain)
+  eval/    scenarios, run_experiments (Chapter-4 CSVs + --check), plot_results
+  tests/   test_pipeline.py (all module self-tests + compile + HTTP/audit e2e)
+
+Detection (filter.py, existing techniques, max-severity compose):
+  Stage1 norm > 2.5× median → MINOR
+  Stage2 cosine to leave-one-out median of prior-trusted < −0.45 → MAJOR
+  Stage3 FoolsGold-style pairwise sim ≥ 0.95 sustained 2 rounds → CRITICAL
+  Stage4 self-history cosine < −0.45 sustained 2 rounds → MAJOR
+
+Audit is a LOCAL hash chain, not blockchain. An earlier Polygon iteration was
+replaced by audit/hashchain.py. No smart contracts in the current codebase. A
+thin public anchor (write head hash to a minimal contract) is stated FUTURE
+WORK only — do not reintroduce blockchain unless explicitly asked.
+
+Trust model: server trusted (centralized FL); clients untrusted; only the
+manufacturer roots/intermediates in the CA bundle are trusted. Weight =
+cap(tier)·T; banned devices absent from weights → structurally excluded from
+aggregation. Krum uses weights as an eligibility mask (O4).
+
+---
+
+## 8. Related work positioning (for thesis Ch.2 / defense)
+
+  FoolsGold [Fung 2018]: gradient-similarity detection only; no identity, no
+    cost to re-register. DLTF includes a FoolsGold-style stage but adds
+    hardware-bound identity that detection binds to.
+  Kang 2019/2020 (multi-weight subjective logic FL reputation): DLTF's flagship
+    citation. Source of two principles used — negative weighted > positive
+    (interaction effects), recent > past (interaction timeliness). Do NOT copy
+    their numeric weights (vehicular-specific) — would erase DLTF's tier priors.
+    Sui 2024 review documents Kang's new-vs-old-client flaw = the same flaw the
+    supervisor flagged.
+  Josang 2001 (subjective logic): the formal foundation. DLTF's trust formula IS
+    his E = b + a·u; his Def.10 (least-uncertainty ordering) = DLTF's rank().
+  Wang 2022 (TPM + blockchain oracle FL): uses TPM for update INTEGRITY, not
+    persistent identity binding. DLTF binds identity so bans survive re-join.
+  Friedman & Resnick 2001 (cheap pseudonyms) + Ostrom 1990 (graduated
+    sanctions): justify tier-coupling (policy scales with identity cost).
+  Honesty rule: NO paper prescribes the 1/3/8-style values — they are derived
+    from DLTF's own policy rules. Claiming a paper gives them = fabricated
+    citation. Defend by derivation, not citation.
+
+---
+
+## 9. Known limitations (state ALL in thesis)
+
+  X.509 path validation simplified (name chain + signatures; no revocation /
+  full RFC 5280 / EK-profile OIDs). Plain HTTP at request level (mitigated by
+  Tailscale/WireGuard in deployment; request-level auth is future work). Tier 1
+  only where a verifiable EK cert exists — claim is "whitewashing becomes
+  hardware-cost-bound", never "impossible". Audit log centralized (verifiable,
+  not consensus). In-memory engine state (restart = re-enroll). Synthetic
+  substrate for trust metrics; MNIST accuracy machine-side. Small federation
+  (2 real / ~10 simulated). Three reputation constants remain [ENG] inside
+  derived bounds (exact caps, 2:1 forgetting ratio, θ_ban backstop) — defended
+  by the threshold sweep, not citation. Uncertainty u never reaches 0 (bounded
+  memory) — deliberate, this is what defeats sleepers.
+
+---
+
+## 10. PENDING / next steps
+
+  ⚠ RE-RUN Chapter-4 evaluations. Reputation constants changed (γ for Tier 2/3
+    now 0.833/0.750; CRITICAL de-weighted), so prior CSV numbers are stale.
+    Command: `PYTHONPATH=. python3 -m eval.run_experiments --exp all --seeds 5
+    --rounds 30 --out results --check`, then plot_results.
+  - Before re-run: `grep -rn "BAD_EVIDENCE\[.CRITICAL" eval/ trust/` — CRITICAL
+    is no longer a BAD_EVIDENCE key; any code reading it will KeyError.
+  - Verify pipeline still green after the reputation/probation swap:
+    `PYTHONPATH=. python3 tests/test_pipeline.py` (expect "✓ PIPELINE GREEN";
+    downstream Tier-2 honest weights confirmed in range 0.3–0.5).
+  - Live attack demo over Tailscale: one client sends poisoned updates to show a
+    real flag → ban → EK-bound whitewash rejection.
+  - fl/model.py self-test needs torch (machine-side).
+
+Quick-start commands:
+  PYTHONPATH=. python3 tests/test_pipeline.py
+  PYTHONPATH=. python3 check_tiers.py                 # tiers only, no training
+  PYTHONPATH=. python3 run_server.py --rounds 5       # real MNIST over Tailscale
+  PYTHONPATH=. python3 -m net.agent --label client1 --port 8470   # on each client
+  PYTHONPATH=. python3 trust/reputation.py            # reputation self-test
+  PYTHONPATH=. python3 trust/probation.py             # probation self-test
