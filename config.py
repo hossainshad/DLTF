@@ -15,14 +15,14 @@ NUM_CLIENTS = 2
 CLIENTS = [
     {
         "device_label": "client1",
-        "tpm_backend":  "mock",
-        "tcti":         None,
+        "tpm_backend":  "real",
+        "tcti":         "device:/dev/tpmrm0",
         "endpoint":     "http://100.70.28.2:8470",
     },
     {
         "device_label": "client2",
-        "tpm_backend":  "mock",
-        "tcti":         None,
+        "tpm_backend":  "real",
+        "tcti":         "device:/dev/tpmrm0",
         "endpoint":     "http://100.64.57.82:8470",
     },
 

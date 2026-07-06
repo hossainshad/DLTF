@@ -1,19 +1,33 @@
 """
 trust/probation.py
 
-Rehabilitation trial for devices placed on probation by reputation.py. Only Tier 1
-identities ever reach here (reputation bans lower tiers outright), so this is the
-mechanism that lets a non-evadable identity earn reinstatement.
+Rehabilitation trial for devices placed on probation by reputation.py. Only
+Tier-1 identities ever reach here (reputation bans lower tiers outright), so
+this is the mechanism that lets a non-evadable identity earn reinstatement.
 
-  O3 quantified trust : recovery is decided by the OLS slope of an isolated shadow
-                        model, with documented thresholds. Not a heuristic.
+  O3 quantified trust : recovery is decided by the OLS slope of an isolated
+                        shadow model, with documented thresholds. Not a
+                        heuristic.
 
 Anti-gaming properties:
   - Window length is HMAC(device_id, entry_round), random per process, so an
     attacker cannot time a "behave just long enough" attack.
-  - The shadow model accumulates ONLY this device's gradients on a frozen global
-    snapshot, so improvement from the honest federation cannot mask a bad actor.
+  - The shadow model accumulates ONLY this device's gradients on a frozen
+    global snapshot, so improvement from the honest federation cannot mask a
+    bad actor.
   - The window extension is one-shot.
+
+Window bounds [DERIVED]:
+  WINDOW_MIN = 4       the shortest series where a single outlier cannot by
+                       itself determine the sign of the OLS slope.
+  WINDOW_MAX = 9       K1 - 1: a trial must resolve within the Tier-1 trust
+                       memory horizon (K1 = 10 rounds, see reputation.py).
+
+Coupling to reputation (supervisor request): the slope decides the BRANCH
+(reinstate / one-shot extend / permanent ban); the passed trial rounds are
+forwarded to reputation.reinstate() as earned evidence, so a longer or
+stronger proven recovery returns with proportionally higher trust. The trial
+rounds are data the system already counted; no new constants are introduced.
 
 reputation.py is reached through a duck-typed engine (reinstate, record_event),
 so this module has no import dependency on it and self-tests standalone.
@@ -29,10 +43,10 @@ from dataclasses import dataclass, field
 REINSTATE_SLOPE = 0.005
 EXTEND_SLOPE = 0.001
 EXTENSION_ROUNDS = 3
-WINDOW_MIN, WINDOW_MAX = 4, 9
+WINDOW_MIN, WINDOW_MAX = 4, 9   # [DERIVED] OLS stability floor; K1 - 1 ceiling
 
-# Random per process. An attacker who knows device_id and entry_round still cannot
-# predict the window length.
+# Random per process. An attacker who knows device_id and entry_round still
+# cannot predict the window length.
 HMAC_SALT = os.urandom(16)
 
 
@@ -90,8 +104,8 @@ class ProbationRecord:
 
 class ProbationPoolManager:
     def __init__(self, rep_engine=None):
-        # rep_engine is any object exposing reinstate(device_id) and
-        # record_event(device_id, severity). The real one is trust.reputation.
+        # rep_engine is any object exposing reinstate(device_id, trial_rounds=0)
+        # and record_event(device_id, severity). The real one is trust.reputation.
         self.rep = rep_engine
         self._records = {}
 
@@ -116,8 +130,8 @@ class ProbationPoolManager:
         return self._records.get(device_id)
 
     def step(self, round_id, device_gradients, eval_fn):
-        """Advance every active probation trial by one round. Returns the list of
-        (device_id, outcome) for trials that reached a decision this round."""
+        """Advance every active probation trial by one round. Returns the list
+        of (device_id, outcome) for trials that reached a decision this round."""
         decided = []
         for device_id in self.active():
             rec = self._records[device_id]
@@ -136,11 +150,13 @@ class ProbationPoolManager:
             rec.outcome = ProbationOutcome.REINSTATED
             rec.outcome_round = round_id
             if self.rep:
-                self.rep.reinstate(rec.device_id)
+                # the trial rounds are evidence: forward them (see docstring)
+                self.rep.reinstate(rec.device_id,
+                                   trial_rounds=len(rec.accuracy_series))
         elif slope >= EXTEND_SLOPE and not rec.extended:
             rec.extended = True
             rec.window += EXTENSION_ROUNDS
-            rec.outcome = ProbationOutcome.EXTENDED          # non-terminal, trial continues
+            rec.outcome = ProbationOutcome.EXTENDED     # non-terminal, continues
         else:
             rec.outcome = ProbationOutcome.PERMANENT_BAN
             rec.outcome_round = round_id
@@ -166,8 +182,8 @@ class _StubRep:
     def __init__(self):
         self.reinstated = []
         self.banned = []
-    def reinstate(self, device_id):
-        self.reinstated.append(device_id)
+    def reinstate(self, device_id, trial_rounds=0):
+        self.reinstated.append((device_id, trial_rounds))
         return True
     def record_event(self, device_id, severity):
         self.banned.append((device_id, severity))
@@ -179,12 +195,12 @@ def _self_test():
     assert ols_slope([1, 2, 3, 4]) == 1.0
     assert ols_slope([0.5, 0.5, 0.5]) == 0.0
     assert ols_slope([7]) == 0.0
-    print("✓ OLS slope correct on linear, flat, single-point series")
+    print("\u2713 OLS slope correct on linear, flat, single-point series")
 
     for did, rnd in [("a", 0), ("b", 5), ("client3", 99)]:
         w = derive_window(did, rnd)
         assert WINDOW_MIN <= w <= WINDOW_MAX
-    print(f"✓ HMAC window always in [{WINDOW_MIN}, {WINDOW_MAX}]")
+    print(f"\u2713 HMAC window always in [{WINDOW_MIN}, {WINDOW_MAX}]")
 
     rep = _StubRep()
     mgr = ProbationPoolManager(rep_engine=rep)
@@ -193,7 +209,8 @@ def _self_test():
     mgr.enter_probation("fail", 0, g0)      # flat accuracy
     mgr.enter_probation("extend", 0, g0)    # marginal accuracy
 
-    grads = {"recover": [1.0, 0, 0, 0], "fail": [0.0, 0, 0, 0], "extend": [0.1, 0, 0, 0]}
+    grads = {"recover": [1.0, 0, 0, 0], "fail": [0.0, 0, 0, 0],
+             "extend": [0.1, 0, 0, 0]}
     eval_fn = lambda p: 0.5 + 0.02 * p[0]
 
     seen = {}
@@ -203,25 +220,30 @@ def _self_test():
         for device_id, outcome in mgr.step(round_id, grads, eval_fn):
             seen.setdefault(device_id, []).append(outcome)
 
-    assert mgr.get_record("recover").outcome == ProbationOutcome.REINSTATED
-    assert "recover" in rep.reinstated
-    print("✓ rising shadow accuracy -> REINSTATED, reputation.reinstate called")
+    rec = mgr.get_record("recover")
+    assert rec.outcome == ProbationOutcome.REINSTATED
+    ids = [d for d, _ in rep.reinstated]
+    assert "recover" in ids
+    rounds = dict(rep.reinstated)["recover"]
+    assert rounds == len(rec.accuracy_series) and rounds >= WINDOW_MIN + 1
+    print(f"\u2713 rising shadow accuracy -> REINSTATED; {rounds} trial rounds "
+          "forwarded to reputation as earned evidence")
 
     assert mgr.get_record("fail").outcome == ProbationOutcome.PERMANENT_BAN
     assert ("fail", "CRITICAL") in rep.banned
-    print("✓ flat shadow accuracy -> PERMANENT_BAN, CRITICAL pushed to reputation")
+    print("\u2713 flat shadow accuracy -> PERMANENT_BAN, CRITICAL pushed to reputation")
 
     assert ProbationOutcome.EXTENDED in seen["extend"]
     assert mgr.get_record("extend").outcome == ProbationOutcome.PERMANENT_BAN
     assert mgr.get_record("extend").extended is True
-    print("✓ marginal accuracy -> one-shot EXTENDED, then PERMANENT_BAN")
+    print("\u2713 marginal accuracy -> one-shot EXTENDED, then PERMANENT_BAN")
 
     assert mgr.is_on_probation("recover") is False
     s = mgr.summary("fail")
     assert s["outcome"] == "PERMANENT_BAN" and "ols_slope" in s
-    print("✓ terminal trials closed, summary exports for audit")
+    print("\u2713 terminal trials closed, summary exports for audit")
 
-    print("✓ all probation self-tests passed")
+    print("\u2713 all probation self-tests passed")
 
 
 if __name__ == "__main__":

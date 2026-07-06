@@ -64,7 +64,7 @@ tpm2_getekcertificate -u ek.pub -o ek.crt -X 2>/dev/null
 [ -s ek.crt ] && echo "HAS EK CERT" || echo "NO EK CERT (caps at Tier 2)"
 
 # 3.2 if HAS EK CERT and you have built the CA bundle (see tpm/FETCH_EK_CERT.md):
-PYTHONPATH=. python3 -m tpm.check_ek_cert --ek-cert ek.crt --ca-bundle tpm/ca/amd_ftpm_ca.pem
+PYTHONPATH=. python3 -m tpm.check_ek_cert --ek-cert cert/ek.crt --ca-bundle tpm/ca/amd_ftpm_ca.pem
 # EXPECT "Tier 1 HARDWARE" if the cert chains; otherwise "Tier 2".
 # To build the bundle on a new AMD machine, follow tpm/FETCH_EK_CERT.md.
 

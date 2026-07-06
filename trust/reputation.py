@@ -1,46 +1,56 @@
 """
 trust/reputation.py
 
-Reputation engine with a TIER-COUPLED response policy. This is the core of the
-contribution: the severity and reversibility of a sanction depend on the
-hardware-trust tier assigned at enrollment, not on behaviour alone.
+Bayesian reputation engine in subjective-logic form (Josang 2001; Josang &
+Ismail 2002) with a TIER-COUPLED response policy: sanction severity and
+reversibility depend on the hardware-trust tier assigned at enrollment
+(identity replacement cost), not on behaviour alone.
 
-  O2 anti-whitewashing  : a banned EK hash is retained; a returning banned identity
-                          is re-banned at registration, so a ban cannot be reset.
-  O3 quantified trust   : trust is the posterior expectation of a Beta distribution.
+  O2 anti-whitewashing  : bans bind to the EK hash; a returning banned identity
+                          is re-banned at registration.
+  O3 quantified trust   : T = E(opinion) = b + a*u = (a0+s)/(a0+b0+s+f).
   O4 aggregator-agnostic: get_all_weights() returns dict[str, float].
 
-ARITHMETIC (Bayesian beta reputation, Josang & Ismail 2002):
+DERIVATION CHAIN. Every constant below traces to a citation [CITED], a stated
+rule plus algebra [DERIVED], or a sweep-defended engineering choice [ENG]:
 
-    T = (a0 + s) / (a0 + s + b0 + f)
+  B0 = 2              prior doubt for EVERY tier = Josang's non-informative
+                      prior weight [CITED]. Identity proof says nothing about
+                      future behaviour, so doubt never shrinks with tier.
+  W_MINOR = 1         one observation = one count [CITED].
+  W_MAJOR = 3         noise separation: the detector's sustained window is 2
+                      rounds, so 2 spurious MINORs must stay below 1 deliberate
+                      MAJOR; minimal integer with 2*1 < w [DERIVED].
+  A0(T1) = B0+2w = 8  policy P1: fresh Tier-1 reaches probation (T <= 0.5) at
+                      EXACTLY its 2nd MAJOR. Start trust 0.80 is an OUTPUT of
+                      this rule, not an input [DERIVED].
+  A0(T2) = A0(T1)/2   activation-only proof earns half credit (mirrors the 0.5
+                      cap). Verified: sanctioned by 1 MAJOR (4/9 = 0.44),
+                      survives 1 MINOR (4/7 = 0.57) [DERIVED].
+  A0(T3) = B0 = 2     principle of insufficient reason, a = 0.5 [CITED]. Zero
+                      tolerance EMERGES: one MINOR puts 2/5 = 0.40 <= 0.5.
+  K = A0 + B0         prior mass; RULE: memory span N = K (prior mass and
+                      memory are the same currency, rounds of evidence), so
+                      gamma = 1 - 1/K and T_max = 1 - 1/K [DERIVED].
+  PROBATION_T = 0.5   indifference point; Kang's trusted-worker threshold
+                      [CITED].
+  REINSTATE_T = 0.55  reinstatement survives one unit of noise:
+                      0.5 * (1 + 1/K1) exactly [DERIVED].
+  BAN_T = 0.3         redundant backstop; probation fires first on every
+                      reachable trajectory (6 MINORs vs 17) [ENG, sweep].
+  CRITICAL            a rule, not a weight: confirmed Sybil evidence is
+                      identity abuse; any finite weight would let banked
+                      history offset it (the sleeper exploit) [DERIVED].
+  M3 = 2              banked history buys weight, not strikes: veteran strike
+                      budget = fresh budget from P1 (Sun et al. on-off)
+                      [DERIVED].
+  FORGIVE_AFTER = 5   probation W_MIN + 1: informal forgetting must not
+                      undercut the formal trial [DERIVED].
+  FORGET = 0.95       distrust fades at half the rate trust decays:
+                      1 - (1-gamma1)/2 (Slovic asymmetry) [ENG, sweep].
 
-s, f are accumulated good/bad evidence; (a0, b0) the prior. Every round is one
-observation: a clean round adds 1 unit of good evidence, offenses add severity-
-weighted bad evidence (MINOR 1, MAJOR 3, CRITICAL 8).
-
-Hardware-informed priors (a0, b0) are set by enrollment tier, so strike tolerance
-EMERGES from the posterior instead of a policy table: a fresh Tier-1 crosses
-probation (T <= 0.5) at exactly its 2nd MAJOR, Tier-2 at its 1st, Tier-3 at any
-offense.
-
-ON-OFF / SLEEPER HARDENING. A naive forgetting factor is itself the attack
-surface. Three mechanisms close both wash-out holes, every constant traceable to
-a rule used elsewhere in DLTF (Sun et al. on-off defense; CONFIDANT recency;
-Slovic 1993 trust asymmetry):
-
-  M1 BOUNDED RECENT GOOD-EVIDENCE. s decays each round at a tier-coupled rate g,
-     so it saturates at 1/(1-g): a clean history cannot bank unbounded cushion.
-     Effective memory 10/5/3 rounds by tier mirrors the weight-cap hierarchy
-     (memory ~ identity replacement cost).
-  M2 EARNED, ASYMMETRIC FORGETTING. Bad evidence is STICKY: it fades only after
-     FORGIVE_AFTER consecutive clean rounds, and only for a tier allowed to
-     rehabilitate. A single good round never launders an offense.
-  M3 SUSTAINED-OFFENSE ESCALATION. Two consecutive MAJORs escalate
-     NON-COMPENSABLY, bypassing the trust score, so a high-s veteran sleeper is
-     still caught in two rounds.
-
-tpm/common.py is the canonical source of the Tier enum. A local fallback is kept
-only so this module self-tests standalone before the package is assembled.
+tpm/common.py is the canonical source of the Tier enum. A local fallback is
+kept only so this module self-tests standalone.
 """
 from enum import Enum
 from dataclasses import dataclass
@@ -69,30 +79,33 @@ class Status(str, Enum):
     BANNED = "BANNED"
 
 
-# THE NOVELTY. Response policy keyed on the hardware-trust tier.
-#   PRIORS     : Beta prior (a0, b0); a manufacturer-certified TPM is itself
-#                evidence of accountability, so it starts with more good prior.
-#   TIER_CAP   : max aggregation weight, independent of trust.
-#   REHAB      : whether a sanctioned device of this tier may be rehabilitated.
-#   GAMMA_GOOD : M1 recency decay; effective memory 1/(1-g) = 10 / 5 / 3 rounds.
-#   FORGET     : M2 decay applied to bad evidence once forgiveness is earned.
-PRIORS = {Tier.HARDWARE: (8.0, 2.0), Tier.TPM_RESIDENT: (4.0, 2.0),
-          Tier.SOFTWARE: (2.0, 2.0)}
-TIER_CAP = {Tier.HARDWARE: 1.0, Tier.TPM_RESIDENT: 0.5, Tier.SOFTWARE: 0.1}
-REHAB = {Tier.HARDWARE: True, Tier.TPM_RESIDENT: False, Tier.SOFTWARE: False}
-GAMMA_GOOD = {Tier.HARDWARE: 0.90, Tier.TPM_RESIDENT: 0.80, Tier.SOFTWARE: 0.67}
-FORGET = {Tier.HARDWARE: 0.95, Tier.TPM_RESIDENT: 1.0, Tier.SOFTWARE: 1.0}
+# ---- derived constants (see chain in the module docstring) -------------------
+B0 = 2.0                                          # [CITED] Josang prior weight
+W_MINOR = 1.0                                     # [CITED] unit offence
+W_MAJOR = 3.0                                     # [DERIVED] 2 noise MINORs < 1 MAJOR
 
-FORGIVE_AFTER = 5          # consecutive clean rounds before bad evidence may fade
-MAJOR_RUN_TO_ESCALATE = 2  # consecutive MAJORs -> non-compensable escalation (M3)
+A0 = {Tier.HARDWARE: B0 + 2.0 * W_MAJOR,          # 8  [DERIVED] probation at 2nd MAJOR
+      Tier.TPM_RESIDENT: (B0 + 2.0 * W_MAJOR) / 2.0,  # 4  [DERIVED] half credit
+      Tier.SOFTWARE: B0}                          # 2  [CITED] insufficient reason
+PRIORS = {t: (A0[t], B0) for t in A0}
+K = {t: A0[t] + B0 for t in A0}                   # prior mass = memory span (rule N = K)
+GAMMA_GOOD = {t: 1.0 - 1.0 / K[t] for t in A0}    # [DERIVED] 0.900 / 0.833 / 0.750
+
+TIER_CAP = {Tier.HARDWARE: 1.0, Tier.TPM_RESIDENT: 0.5, Tier.SOFTWARE: 0.1}  # [ENG, bounded]
+REHAB = {Tier.HARDWARE: True, Tier.TPM_RESIDENT: False, Tier.SOFTWARE: False}
+FORGET = {Tier.HARDWARE: 1.0 - (1.0 - GAMMA_GOOD[Tier.HARDWARE]) / 2.0,      # 0.95 [ENG]
+          Tier.TPM_RESIDENT: 1.0, Tier.SOFTWARE: 1.0}                        # 1.0 = never
+
+FORGIVE_AFTER = 5           # [DERIVED] probation W_MIN + 1
+MAJOR_RUN_TO_ESCALATE = 2   # [DERIVED] M3: veteran strike budget = fresh budget
 
 GOOD_EVIDENCE = {"POSITIVE": 1.0, "NEUTRAL": 1.0}
-BAD_EVIDENCE = {"MINOR": 1.0, "MAJOR": 3.0, "CRITICAL": 8.0}
+BAD_EVIDENCE = {"MINOR": W_MINOR, "MAJOR": W_MAJOR}   # CRITICAL is a rule, not a weight
 
-PROBATION_T = 0.5          # trust at or below -> probation review
-BAN_T = 0.3                # trust at or below -> ban
-REINSTATE_T = 0.55         # closed-form target trust on reinstatement
-PROBATION_WEIGHT_CAP = 0.1
+PROBATION_T = 0.5                                            # [CITED]
+REINSTATE_T = PROBATION_T * (1.0 + 1.0 / K[Tier.HARDWARE])   # 0.55 [DERIVED]
+BAN_T = 0.3                                                  # [ENG] backstop
+PROBATION_WEIGHT_CAP = TIER_CAP[Tier.SOFTWARE]   # suspect <= unproven identity [DERIVED]
 
 
 @dataclass
@@ -109,7 +122,16 @@ class Device:
     @property
     def trust(self):
         a0, b0 = PRIORS[self.tier]
-        return (a0 + self.s) / (a0 + self.s + b0 + self.f)
+        return (a0 + self.s) / (a0 + b0 + self.s + self.f)
+
+    @property
+    def opinion(self):
+        """Subjective-logic opinion (b, d, u, a); trust == b + a*u exactly.
+        u = K/(K+s+f) is the sample-size term: it shrinks as evidence grows."""
+        a0, b0 = PRIORS[self.tier]
+        n = a0 + b0 + self.s + self.f
+        return {"b": self.s / n, "d": self.f / n,
+                "u": (a0 + b0) / n, "a": a0 / (a0 + b0)}
 
 
 class ReputationEngine:
@@ -131,28 +153,34 @@ class ReputationEngine:
             return d.status
         if hasattr(severity, "value"):
             severity = severity.value
-        g = GAMMA_GOOD[d.tier]
 
+        if severity == "CRITICAL":         # rule, non-compensable, no arithmetic
+            d.clean_run = 0
+            d.major_run = 0
+            self._ban(d)
+            return d.status
+
+        g = GAMMA_GOOD[d.tier]
         if severity in GOOD_EVIDENCE:
-            d.s = g * d.s + GOOD_EVIDENCE[severity]    # M1: bounded, recency-weighted
+            d.s = g * d.s + GOOD_EVIDENCE[severity]    # M1: bounded recency
             d.clean_run += 1
             d.major_run = 0
             if REHAB[d.tier] and d.clean_run >= FORGIVE_AFTER:
-                d.f *= FORGET[d.tier]                  # M2: earned, asymmetric forgetting
+                d.f *= FORGET[d.tier]                  # M2: earned, asymmetric
         else:
             d.s = g * d.s
             d.f += BAD_EVIDENCE[severity]
             d.clean_run = 0
             d.major_run = d.major_run + 1 if severity == "MAJOR" else 0
 
-        self._transition(d, severity)
+        self._transition(d)
         return d.status
 
-    def _transition(self, d, severity):
-        if severity == "CRITICAL" or d.trust <= BAN_T:             # non-compensable
+    def _transition(self, d):
+        if d.trust <= BAN_T:                            # backstop
             self._ban(d)
             return
-        if d.major_run >= MAJOR_RUN_TO_ESCALATE:                   # M3
+        if d.major_run >= MAJOR_RUN_TO_ESCALATE:        # M3, bypasses the score
             if REHAB[d.tier]:
                 d.status = Status.PROBATION
             else:
@@ -169,12 +197,17 @@ class ReputationEngine:
         if d.ek_hash is not None:
             self._banned_ek.add(d.ek_hash)
 
-    def reinstate(self, device_id):
+    def reinstate(self, device_id, trial_rounds=0):
+        """Reinstate a probated device. The passed probation rounds are credited
+        as earned good evidence (the trial IS evidence), then trust is floored
+        at REINSTATE_T = 0.55 via the closed form. Stronger proven recovery
+        therefore returns with proportionally higher trust."""
         d = self._dev[device_id]
         if d.status == Status.PROBATION and REHAB[d.tier]:
             a0, b0 = PRIORS[d.tier]
-            need_a = (REINSTATE_T / (1.0 - REINSTATE_T)) * (b0 + d.f)
-            d.s = max(d.s, need_a - a0)                # closed-form lift to T >= 0.55
+            d.s += float(trial_rounds)
+            need_s = (REINSTATE_T / (1.0 - REINSTATE_T)) * (b0 + d.f) - a0
+            d.s = max(d.s, need_s)                     # floor: T >= 0.55
             d.status = Status.ACTIVE
             d.clean_run = 0
             d.major_run = 0
@@ -183,6 +216,18 @@ class ReputationEngine:
 
     def get_status(self, device_id):
         return self._dev[device_id].status
+
+    def get_opinion(self, device_id):
+        return self._dev[device_id].opinion
+
+    def rank(self, device_ids=None):
+        """Josang Def. 10 ordering: highest trust first; ties broken by least
+        uncertainty, so at equal trust the client with more evidence wins.
+        Banned devices are excluded."""
+        ids = list(self._dev) if device_ids is None else list(device_ids)
+        ids = [i for i in ids if self._dev[i].status != Status.BANNED]
+        return sorted(ids, key=lambda i: (-self._dev[i].trust,
+                                          self._dev[i].opinion["u"]))
 
     def get_weight(self, device_id):
         d = self._dev[device_id]
@@ -203,6 +248,20 @@ class ReputationEngine:
 
 def _self_test():
     print("trust/reputation.py self-test")
+
+    assert PRIORS[Tier.HARDWARE] == (8.0, 2.0)
+    assert PRIORS[Tier.TPM_RESIDENT] == (4.0, 2.0)
+    assert PRIORS[Tier.SOFTWARE] == (2.0, 2.0)
+    assert abs(GAMMA_GOOD[Tier.HARDWARE] - 0.90) < 1e-9
+    assert abs(GAMMA_GOOD[Tier.TPM_RESIDENT] - (1.0 - 1.0 / 6.0)) < 1e-9
+    assert abs(GAMMA_GOOD[Tier.SOFTWARE] - 0.75) < 1e-9
+    assert abs(REINSTATE_T - 0.55) < 1e-9
+    assert abs(FORGET[Tier.HARDWARE] - 0.95) < 1e-9
+    assert "CRITICAL" not in BAD_EVIDENCE
+    assert PROBATION_WEIGHT_CAP == TIER_CAP[Tier.SOFTWARE] == 0.1
+    print("\u2713 derivation chain reproduces: priors (8,2)/(4,2)/(2,2), "
+          "gamma = 1-1/K, theta_R = 0.55, FORGET = 0.95")
+
     e = ReputationEngine()
     e.register("hw", Tier.HARDWARE, "ek_hw")
     e.register("tr", Tier.TPM_RESIDENT, "ek_tr")
@@ -210,31 +269,37 @@ def _self_test():
     assert abs(e._dev["hw"].trust - 0.8) < 1e-9
     assert abs(e._dev["tr"].trust - 4 / 6) < 1e-9
     assert abs(e._dev["sw"].trust - 0.5) < 1e-9
-    print("\u2713 hardware-informed priors: starting trust 0.80 / 0.67 / 0.50 by tier")
+    o = e.get_opinion("hw")
+    assert abs(o["b"] + o["d"] + o["u"] - 1.0) < 1e-9
+    assert abs((o["b"] + o["a"] * o["u"]) - e._dev["hw"].trust) < 1e-9
+    print("\u2713 starting trust 0.80/0.67/0.50 = base rates; opinion sane, T = b + a*u")
 
     assert e.record_event("hw", "MAJOR") == Status.ACTIVE
     assert e.record_event("hw", "MAJOR") == Status.PROBATION
     assert abs(e._dev["hw"].trust - 0.5) < 1e-9
-    print("\u2713 emergent policy preserved: fresh Tier-1 probation at the 2nd MAJOR")
+    print("\u2713 P1 emergent: fresh Tier-1 hits probation at exactly the 2nd MAJOR")
 
-    assert e.record_event("tr", "MINOR") == Status.ACTIVE
-    assert e.record_event("tr", "MAJOR") == Status.BANNED
-    assert e.record_event("sw", "MINOR") == Status.BANNED
-    print("\u2713 emergent policy: Tier-2 one MAJOR strike, Tier-3 zero tolerance")
+    assert e.record_event("tr", "MINOR") == Status.ACTIVE   # survives noise
+    assert e.record_event("tr", "MAJOR") == Status.BANNED   # P2
+    assert e.record_event("sw", "MINOR") == Status.BANNED   # P3 emerges from a=0.5
+    print("\u2713 P2/P3 emergent: Tier-2 survives a MINOR, one MAJOR strike; "
+          "Tier-3 zero tolerance")
 
     b = ReputationEngine()
     b.register("vet", Tier.HARDWARE, "ek_vet")
     for _ in range(100):
         b.record_event("vet", "NEUTRAL")
-    cap = 1.0 / (1.0 - GAMMA_GOOD[Tier.HARDWARE])
-    assert b._dev["vet"].s < cap + 1e-6 and b._dev["vet"].s > 9.0
-    print(f"\u2713 M1 bounded buffer: 100 clean rounds saturate s at "
-          f"{b._dev['vet'].s:.2f} (cap {cap:.0f}), not 100")
+    cap = K[Tier.HARDWARE]                       # s_max = 1/(1-gamma) = K
+    assert 9.0 < b._dev["vet"].s < cap + 1e-6
+    assert b._dev["vet"].trust < 1.0 - 1.0 / cap + 1e-9   # T_max = 1 - 1/K
+    print(f"\u2713 M1 bounded memory: 100 clean rounds saturate s at "
+          f"{b._dev['vet'].s:.2f} (cap {cap:.0f}); T_max = {1-1/cap:.2f}")
 
     assert b.record_event("vet", "MAJOR") == Status.ACTIVE
-    assert b._dev["vet"].trust > 0.5
-    assert b.record_event("vet", "MAJOR") == Status.PROBATION
-    print("\u2713 M3 sleeper defense: veteran (high banked trust) caught at the 2nd MAJOR")
+    st = b.record_event("vet", "MAJOR")
+    assert st == Status.PROBATION and b._dev["vet"].trust > 0.5
+    print("\u2713 M3 sleeper defense: veteran probated at the 2nd MAJOR even though "
+          f"its score ({b._dev['vet'].trust:.3f}) is still above 0.5")
 
     o = ReputationEngine()
     o.register("onoff", Tier.HARDWARE, "ek_on")
@@ -243,14 +308,12 @@ def _self_test():
     for _ in range(FORGIVE_AFTER - 1):
         o.record_event("onoff", "NEUTRAL")
     assert o._dev["onoff"].f == f_atk
-    print(f"\u2713 M2 on-off blocked: {FORGIVE_AFTER - 1} clean rounds launder nothing "
-          f"(f stays {f_atk:.1f})")
-
     for _ in range(20):
         o.record_event("onoff", "NEUTRAL")
     assert o._dev["onoff"].f < f_atk and o._dev["onoff"].trust > 0.8
-    print(f"\u2713 M2 earned forgiveness: a sustained streak fades the offense "
-          f"(f {f_atk:.1f} -> {o._dev['onoff'].f:.2f})")
+    print(f"\u2713 M2 earned forgetting: {FORGIVE_AFTER - 1} clean rounds launder "
+          f"nothing; a sustained streak fades f {f_atk:.1f} -> "
+          f"{o._dev['onoff'].f:.2f}")
 
     t2 = ReputationEngine()
     t2.register("c", Tier.TPM_RESIDENT, "ek_c2")
@@ -266,18 +329,42 @@ def _self_test():
     for _ in range(100):
         e2.record_event("x", "NEUTRAL")
     assert e2.record_event("x", "CRITICAL") == Status.BANNED
+    assert e2._dev["x"].f == 0.0                       # rule, no arithmetic
     assert e2.register("x2", Tier.HARDWARE, "ek_x") == Status.BANNED
-    print("\u2713 CRITICAL non-compensable even for a veteran; banned EK stays banned (O2)")
+    print("\u2713 CRITICAL bans by rule (no dead weight), regardless of banked "
+          "history; banned EK stays banned (O2)")
 
     p = ReputationEngine()
     p.register("p", Tier.HARDWARE, "ek_p")
     p.record_event("p", "MAJOR"); p.record_event("p", "MAJOR")
     assert p.get_status("p") == Status.PROBATION
     assert p.get_weight("p") <= PROBATION_WEIGHT_CAP
-    assert p.reinstate("p") is True
-    assert p.get_status("p") == Status.ACTIVE and p._dev["p"].trust >= 0.55
+    p.register("q", Tier.HARDWARE, "ek_q")
+    p.record_event("q", "MAJOR"); p.record_event("q", "MAJOR")
+    p.register("r", Tier.HARDWARE, "ek_r")
+    p.record_event("r", "MAJOR"); p.record_event("r", "MAJOR")
+    assert p.reinstate("r") is True                    # no trial credit: floor
+    assert abs(p._dev["r"].trust - REINSTATE_T) < 1e-6
+    assert p.reinstate("p", trial_rounds=6) is True
+    assert p.reinstate("q", trial_rounds=9) is True
+    assert p._dev["q"].trust > p._dev["p"].trust >= REINSTATE_T
     assert p._dev["p"].major_run == 0 and p._dev["p"].clean_run == 0
-    print("\u2713 probation cap, closed-form reinstatement, streak reset on re-entry")
+    print(f"\u2713 reinstatement: floor T = {REINSTATE_T}; trial rounds are "
+          f"evidence, stronger recovery returns higher "
+          f"({p._dev['q'].trust:.3f} > {p._dev['p'].trust:.3f})")
+
+    rk = ReputationEngine()
+    rk.register("new", Tier.HARDWARE, "ek_new")
+    rk.register("old", Tier.HARDWARE, "ek_old")
+    for _ in range(60):
+        rk.record_event("old", "NEUTRAL")
+    for _ in range(3):
+        rk.record_event("new", "NEUTRAL")
+    assert rk.rank() == ["old", "new"]
+    assert rk.get_opinion("old")["u"] < rk.get_opinion("new")["u"]
+    print(f"\u2713 fairness (Def. 10): veteran ({rk._dev['old'].trust:.3f}, "
+          f"u={rk.get_opinion('old')['u']:.2f}) outranks newcomer "
+          f"({rk._dev['new'].trust:.3f}, u={rk.get_opinion('new')['u']:.2f})")
 
     print("\u2713 all reputation self-tests passed")
 
