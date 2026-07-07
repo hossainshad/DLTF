@@ -16,6 +16,19 @@ Anti-gaming properties:
     global snapshot, so improvement from the honest federation cannot mask a
     bad actor.
   - The window extension is one-shot.
+  - Rehabilitation itself is one-shot PER IDENTITY [DERIVED]: a reinstated
+    device that re-enters probation is permanently banned instead of retried.
+    Without this, an adaptive attacker cycles attack -> probation -> behave ->
+    reinstate forever, buying 1-2 attack rounds per cycle at zero identity
+    cost. Graduated sanctions (Ostrom 1990, already cited for tier coupling):
+    the second offense escalates. Attacker cost per Tier-1 identity is then
+    bounded at ~4 total attack rounds before the physical TPM is burned.
+
+Slope estimator: OLS by default (matches the WINDOW_MIN derivation).
+SLOPE_ESTIMATOR = "theil_sen" switches to the Theil-Sen median-of-pairwise
+slopes (Theil 1950; Sen 1968), robust to a single-round accuracy outlier.
+Recommended for the machine-side MNIST deployment where per-round validation
+accuracy is noisy; thresholds are unchanged (both estimate accuracy/round).
 
 Window bounds [DERIVED]:
   WINDOW_MIN = 4       the shortest series where a single outlier cannot by
@@ -44,6 +57,7 @@ REINSTATE_SLOPE = 0.005
 EXTEND_SLOPE = 0.001
 EXTENSION_ROUNDS = 3
 WINDOW_MIN, WINDOW_MAX = 4, 9   # [DERIVED] OLS stability floor; K1 - 1 ceiling
+SLOPE_ESTIMATOR = "ols"         # "ols" | "theil_sen" (robust, for noisy MNIST)
 
 # Random per process. An attacker who knows device_id and entry_round still
 # cannot predict the window length.
@@ -73,6 +87,23 @@ def ols_slope(y):
     return num / den if den else 0.0
 
 
+def theil_sen_slope(y):
+    """Median of all pairwise slopes (Theil 1950; Sen 1968). Robust to a
+    single-round outlier that would flip the OLS sign. 0.0 for n < 2."""
+    n = len(y)
+    if n < 2:
+        return 0.0
+    slopes = sorted((y[j] - y[i]) / (j - i)
+                    for i in range(n) for j in range(i + 1, n))
+    m = len(slopes)
+    mid = m // 2
+    return slopes[mid] if m % 2 else 0.5 * (slopes[mid - 1] + slopes[mid])
+
+
+def estimate_slope(y):
+    return theil_sen_slope(y) if SLOPE_ESTIMATOR == "theil_sen" else ols_slope(y)
+
+
 def derive_window(device_id, entry_round):
     msg = device_id.encode() + struct.pack(">Q", entry_round)
     digest = hmac.new(HMAC_SALT, msg, hashlib.sha256).digest()
@@ -99,7 +130,7 @@ class ProbationRecord:
         return self.outcome in TERMINAL
 
     def current_slope(self):
-        return ols_slope(self.accuracy_series)
+        return estimate_slope(self.accuracy_series)
 
 
 class ProbationPoolManager:
@@ -110,6 +141,17 @@ class ProbationPoolManager:
         self._records = {}
 
     def enter_probation(self, device_id, entry_round, global_params):
+        prior = self._records.get(device_id)
+        if prior is not None and prior.outcome == ProbationOutcome.PERMANENT_BAN:
+            return prior                     # already terminal, nothing to open
+        if prior is not None and prior.outcome == ProbationOutcome.REINSTATED:
+            # rehabilitation is one-shot per identity: a reinstated device that
+            # re-offends is banned, not retried (graduated sanctions, Ostrom).
+            prior.outcome = ProbationOutcome.PERMANENT_BAN
+            prior.outcome_round = entry_round
+            if self.rep:
+                self.rep.record_event(device_id, "CRITICAL")
+            return prior
         rec = ProbationRecord(
             device_id=device_id,
             entry_round=entry_round,
@@ -242,6 +284,24 @@ def _self_test():
     s = mgr.summary("fail")
     assert s["outcome"] == "PERMANENT_BAN" and "ols_slope" in s
     print("\u2713 terminal trials closed, summary exports for audit")
+
+    # one-shot rehabilitation: the reinstated device re-offends -> banned,
+    # no second trial is opened.
+    rec2 = mgr.enter_probation("recover", 50, g0)
+    assert rec2.outcome == ProbationOutcome.PERMANENT_BAN
+    assert ("recover", "CRITICAL") in rep.banned
+    assert mgr.is_on_probation("recover") is False
+    rec3 = mgr.enter_probation("recover", 60, g0)     # idempotent once terminal
+    assert rec3 is rec2
+    print("\u2713 rehab is one-shot per identity: second entry -> PERMANENT_BAN, "
+          "adaptive probation cycling closed")
+
+    assert theil_sen_slope([1, 2, 3, 4]) == 1.0
+    assert theil_sen_slope([7]) == 0.0
+    noisy = [0.50, 0.51, 0.52, 0.53, 0.14]      # one bad validation round
+    assert ols_slope(noisy) < 0 < theil_sen_slope(noisy)
+    print("\u2713 Theil-Sen matches OLS on clean series, survives the outlier "
+          "that flips the OLS sign")
 
     print("\u2713 all probation self-tests passed")
 

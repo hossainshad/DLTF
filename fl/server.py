@@ -119,10 +119,18 @@ class FederatedServer:
             if was == Status.ACTIVE and now == Status.PROBATION:
                 rec = self.probation.get_record(label)
                 if rec is None or rec.outcome == ProbationOutcome.REINSTATED:
-                    self.probation.enter_probation(label, round_id, self.global_params)
+                    rec = self.probation.enter_probation(label, round_id,
+                                                         self.global_params)
+                    exhausted = rec.outcome == ProbationOutcome.PERMANENT_BAN
+                    events[label]["status"] = self.rep.get_status(label).value
                     if self.audit:
-                        self.audit.append("PROBATION_ENTER",
-                                          {"round": round_id, "device": label})
+                        if exhausted:
+                            self.audit.append("REHAB_EXHAUSTED",
+                                              {"round": round_id, "device": label,
+                                               "ek_hash": self.enrolled[label]["ek_hash"]})
+                        else:
+                            self.audit.append("PROBATION_ENTER",
+                                              {"round": round_id, "device": label})
 
         on_probation = [d for d in updates if self.probation.is_on_probation(d)]
         decided = self.probation.step(
